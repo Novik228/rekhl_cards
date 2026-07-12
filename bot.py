@@ -173,6 +173,64 @@ def update_coins(user_id: int, amount: int) -> int:
     save_data(COINS_FILE, coins_data)
     return new_amount
 
+# ========== НОВЫЕ ФУНКЦИИ ДЛЯ БАФФОВ ==========
+
+# Получить активную карту баффа
+def get_active_buff(user_id: int):
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    return user_data.get("buff_card", None)  # {"card_id": int, "level": int} or None
+
+# Установить активную карту баффа (уровень 1)
+def set_active_buff(user_id: int, card_id: int):
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    user_data["buff_card"] = {"card_id": card_id, "level": 1}
+    users[str(user_id)] = user_data
+    save_data(USERS_FILE, users)
+
+# Обновить уровень активной карты
+def update_buff_level(user_id: int, new_level: int):
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    if "buff_card" in user_data:
+        user_data["buff_card"]["level"] = new_level
+        users[str(user_id)] = user_data
+        save_data(USERS_FILE, users)
+
+# Удалить активную карту баффа
+def clear_active_buff(user_id: int):
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    if "buff_card" in user_data:
+        del user_data["buff_card"]
+        users[str(user_id)] = user_data
+        save_data(USERS_FILE, users)
+
+# Получить множитель кулдауна (0..1) на основе уровня баффа
+def get_cooldown_multiplier(user_id: int) -> float:
+    buff = get_active_buff(user_id)
+    if not buff:
+        return 1.0
+    level = buff["level"]
+    reduction = min(level * 5, 80)  # максимум 80%
+    return 1.0 - reduction / 100.0
+
+# Получить бонус к монетам (множитель > 1)
+def get_coin_bonus_multiplier(user_id: int) -> float:
+    buff = get_active_buff(user_id)
+    if not buff:
+        return 1.0
+    level = buff["level"]
+    bonus = level * 5  # +5% за уровень
+    return 1.0 + bonus / 100.0
+
+# Проверка, может ли карта быть использована для баффа (редкость Легендарная или выше)
+def is_legendary_or_higher(rarity: str) -> bool:
+    return rarity in ["Легендарная", "Блещет умом", "Эксклюзивная"]
+
+# ========== КОНЕЦ НОВЫХ ФУНКЦИЙ ==========
+
 # Обработчик команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -232,7 +290,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/balance - баланс монет\n"
                 "/card_info <card_id> - информация о карточке\n"
                 "/craft - улучшить карточки\n"
-                "/leaderboard - таблица лидеров"
+                "/leaderboard - таблица лидеров\n"
+                "/casino <сумма> - сыграть в казино\n"
+                "/coin <орел|решка> <сумма> - подбросить монетку\n"
+                "/buff - информация о текущем баффе\n"
+                "/set_buff <card_id> - выбрать карту для баффа\n"
+                "/upgrade_buff - улучшить активную карту баффа"
             )
         elif is_moderator(user.id):
             await update.message.reply_text(
@@ -252,7 +315,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/balance - баланс монет\n"
                 "/card_info <card_id> - информация о карточке\n"
                 "/craft - улучшить карточки\n"
-                "/leaderboard - таблица лидеров"
+                "/leaderboard - таблица лидеров\n"
+                "/casino <сумма> - сыграть в казино\n"
+                "/coin <орел|решка> <сумма> - подбросить монетку\n"
+                "/buff - информация о текущем баффе\n"
+                "/set_buff <card_id> - выбрать карту для баффа\n"
+                "/upgrade_buff - улучшить активную карту баффа"
             )
         else:
             await context.bot.send_message(
@@ -269,7 +337,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/balance - Баланс монет\n"
                 "/card_info <card_id> - Информация о карточке\n"
                 "/craft - Улучшить карточки\n"
-                "/leaderboard - Таблица лидеров\n\n"
+                "/leaderboard - Таблица лидеров\n"
+                "/casino <сумма> - Сыграть в казино\n"
+                "/coin <орел|решка> <сумма> - Подбросить монетку\n"
+                "/buff - Информация о текущем баффе\n"
+                "/set_buff <card_id> - Выбрать карту для баффа\n"
+                "/upgrade_buff - Улучшить активную карту баффа\n\n"
                 "⏳ Карточку можно получать каждые 6 часов!"
             )
     else:
@@ -300,7 +373,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/balance - баланс монет\n"
                 "/card_info <card_id> - информация о карточке\n"
                 "/craft - улучшить карточки\n"
-                "/leaderboard - таблица лидеров"
+                "/leaderboard - таблица лидеров\n"
+                "/casino <сумма> - сыграть в казино\n"
+                "/coin <орел|решка> <сумма> - подбросить монетку\n"
+                "/buff - информация о текущем баффе\n"
+                "/set_buff <card_id> - выбрать карту для баффа\n"
+                "/upgrade_buff - улучшить активную карту баффа"
             )
         elif is_moderator(user.id):
             await update.message.reply_text(
@@ -320,7 +398,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/balance - баланс монет\n"
                 "/card_info <card_id> - информация о карточке\n"
                 "/craft - улучшить карточки\n"
-                "/leaderboard - таблица лидеров"
+                "/leaderboard - таблица лидеров\n"
+                "/casino <сумма> - сыграть в казино\n"
+                "/coin <орел|решка> <сумма> - подбросить монетку\n"
+                "/buff - информация о текущем баффе\n"
+                "/set_buff <card_id> - выбрать карту для баффа\n"
+                "/upgrade_buff - улучшить активную карту баффа"
             )
         else:
             await update.message.reply_text(
@@ -333,11 +416,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/balance - Баланс монет\n"
                 "/card_info <card_id> - Информация о карточке\n"
                 "/craft - Улучшить карточки\n"
-                "/leaderboard - Таблица лидеров\n\n"
+                "/leaderboard - Таблица лидеров\n"
+                "/casino <сумма> - Сыграть в казино\n"
+                "/coin <орел|решка> <сумма> - Подбросить монетку\n"
+                "/buff - Информация о текущем баффе\n"
+                "/set_buff <card_id> - Выбрать карту для баффа\n"
+                "/upgrade_buff - Улучшить активную карту баффа\n\n"
                 "⏳ Карточку можно получать каждые 6 часов!"
             )
 
-# Выдача карточки пользователю
+# Выдача карточки пользователю (модифицировано для баффов)
 async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     
@@ -353,19 +441,18 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user.id), {})
     
-    # Проверка времени
+    # Проверка времени с учётом баффа
     current_time = time.time()
     last_drop = user_data.get("last_drop", 0)
-    cooldown = 6 * 3600  # 6 часов в секундах
+    base_cooldown = 6 * 3600  # 6 часов в секундах
+    cooldown_multiplier = get_cooldown_multiplier(user.id)
+    effective_cooldown = base_cooldown * cooldown_multiplier
     
-    time_left = cooldown - (current_time - last_drop)
+    time_left = effective_cooldown - (current_time - last_drop)
     
     if time_left > 0:
-        # Рассчитываем оставшееся время
         hours = int(time_left // 3600)
         minutes = int((time_left % 3600) // 60)
-        
-        # Формируем сообщение
         if hours > 0:
             time_text = f"{hours} час(ов) и {minutes} минут(ы)"
         else:
@@ -395,23 +482,21 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
     
     # Выбор редкости
-    rarities = list(RARITY_CHANCES.keys())
-    weights = [RARITY_CHANCES[r] for r in rarities]
-    chosen_rarity = random.choices(rarities, weights=weights, k=1)[0]
+    rarities_list = list(RARITY_CHANCES.keys())
+    weights = [RARITY_CHANCES[r] for r in rarities_list]
+    chosen_rarity = random.choices(rarities_list, weights=weights, k=1)[0]
     
     # Фильтрация по редкости
     rarity_cards = [c for c in cards if c["rarity"] == chosen_rarity]
     
-    # Если для выбранной редкости нет карточек, попробуем другие редкости
     if not rarity_cards:
         logger.warning(f"Для редкости '{chosen_rarity}' нет карточек! Пробуем другие редкости.")
-        for rarity in rarities:
+        for rarity in rarities_list:
             rarity_cards = [c for c in cards if c["rarity"] == rarity]
             if rarity_cards:
                 logger.info(f"Нашли карточки для редкости: {rarity}")
                 break
     
-    # Если всё равно нет карточек, сообщаем об ошибке
     if not rarity_cards:
         logger.error("В базе нет карточек ни для одной редкости!")
         await update.message.reply_text("⚠️ Ошибка в базе карточек! Обратитесь к администратору.")
@@ -423,14 +508,15 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if "cards" not in user_data:
         user_data["cards"] = []
     
-    # Добавляем карточку
     user_data["cards"].append(card["id"])
     user_data["last_drop"] = current_time
     users[str(user.id)] = user_data
     save_data(USERS_FILE, users)
 
-    # Начисление монет
-    coins_earned = random.randint(10, 50)
+    # Начисление монет с учётом баффа
+    base_coins = random.randint(10, 50)
+    coin_multiplier = get_coin_bonus_multiplier(user.id)
+    coins_earned = int(base_coins * coin_multiplier)
     new_balance = update_coins(user.id, coins_earned)
     
     # Получаем количество этой карточки у пользователя
@@ -444,7 +530,6 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⭐ Редкость: {card['rarity']}\n"
     )
     
-    # Добавляем описание
     if "description" in card:
         caption += f"📝 Описание: {card['description']}\n"
     
@@ -468,7 +553,6 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def show_collection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     
-    # Проверка блокировки
     if is_banned(user.id):
         await update.message.reply_text("❌ Вы заблокированы в этом боте.")
         return
@@ -479,7 +563,6 @@ async def show_collection(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     message = await show_collection_with_ids(user.id)
     
-    # Разбиваем сообщение если слишком длинное
     if len(message) > 4000:
         parts = []
         current = ""
@@ -501,7 +584,6 @@ async def show_collection(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def card_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     
-    # Проверка блокировки
     if is_banned(user.id):
         await update.message.reply_text("❌ Вы заблокированы в этом боте.")
         return
@@ -520,14 +602,12 @@ async def card_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Неверный формат ID! Используйте только цифры.")
         return
     
-    # Проверяем, есть ли карточка у пользователя
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user.id), {})
     if card_id not in user_data.get("cards", []):
         await update.message.reply_text("❌ У вас нет этой карточки в коллекции!")
         return
     
-    # Ищем карточку в базе
     cards = load_data(CARDS_FILE, [])
     card = next((c for c in cards if c["id"] == card_id), None)
     
@@ -535,7 +615,6 @@ async def card_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Карточка не найдена в базе данных!")
         return
     
-    # Формируем сообщение
     emoji = get_rarity_emoji(card["rarity"])
     caption = (
         f"🃏 <b>Информация о карточке</b>\n\n"
@@ -546,11 +625,9 @@ async def card_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if "description" in card:
         caption += f"📝 <b>Описание</b>: {card['description']}\n"
     
-    # Получаем количество этой карточки у пользователя
     card_count = user_data["cards"].count(card_id)
     caption += f"📊 <b>В вашей коллекции</b>: {card_count} шт.\n"
     
-    # Отправляем изображение
     image_path = os.path.join(CARDS_IMAGE_DIR, card["image"])
     if os.path.exists(image_path):
         await update.message.reply_photo(
@@ -572,14 +649,12 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     shop_items = load_data(SHOP_FILE, [])
     
-    # Удаляем просроченные товары
     current_time = time.time()
     active_items = [
         item for item in shop_items 
         if item.get("expire_time", 0) == 0 or item["expire_time"] > current_time
     ]
     
-    # Обновляем файл магазина
     save_data(SHOP_FILE, active_items)
     
     if not active_items:
@@ -592,7 +667,6 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message += f"🏷 Название: {item['name']}\n"
         message += f"💵 Цена: {item['price']} монет\n"
         
-        # Отображаем время до истечения
         if item.get("expire_time", 0) > 0:
             time_left = item["expire_time"] - current_time
             if time_left > 0:
@@ -603,25 +677,19 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if item["type"] == "reset":
             message += "📝 Тип: Сброс таймера получения карточки\n\n"
         elif item["type"] == "pack":
-            # Исправлено: добавлена закрывающая скобка для len()
             message += "📝 Тип: Набор карточек\n"
             message += f"🃏 Карточек в наборе: {len(item['cards'])}\n\n"
     
     message += "ℹ️ Для покупки используйте /buy <ID товара>"
     
-    # Разбиваем сообщение если слишком длинное
     if len(message) > 4000:
         parts = []
         while message:
             if len(message) <= 4000:
                 parts.append(message)
                 break
-                
-            # Находим последний перенос строки в пределах 4000 символов
             last_newline = message[:4000].rfind('\n')
-            
             if last_newline == -1:
-                # Если нет переносов, разбиваем по символам
                 parts.append(message[:4000])
                 message = message[4000:]
             else:
@@ -653,23 +721,19 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Товар не найден!")
         return
     
-    # Проверяем срок действия
     current_time = time.time()
     if item.get("expire_time", 0) > 0 and item["expire_time"] < current_time:
         await update.message.reply_text("❌ Срок действия этого товара истек!")
         return
     
-    # Проверяем баланс
     balance = get_coins(user.id)
     if balance < item["price"]:
         await update.message.reply_text("❌ Недостаточно монет для покупки!")
         return
     
-    # Выполняем покупку
     new_balance = update_coins(user.id, -item["price"])
     
     if item["type"] == "reset":
-        # Сбрасываем таймер
         users = load_data(USERS_FILE, {})
         user_data = users.get(str(user.id), {})
         user_data["last_drop"] = 0
@@ -684,21 +748,18 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     
     elif item["type"] == "pack":
-        # Выдаем ОДНУ случайную карточку из набора
         users = load_data(USERS_FILE, {})
         user_data = users.get(str(user.id), {})
         
         if "cards" not in user_data:
             user_data["cards"] = []
         
-        # Выбираем случайную карточку из набора
         card_id = random.choice(item["cards"])
         user_data["cards"].append(card_id)
         
         users[str(user.id)] = user_data
         save_data(USERS_FILE, users)
         
-        # Получаем информацию о карточке
         cards = load_data(CARDS_FILE, [])
         card = next((c for c in cards if c["id"] == card_id), None)
         
@@ -711,7 +772,6 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             card_rarity = "Неизвестная"
             emoji = "❓"
         
-        # Получаем количество этой карточки у пользователя
         card_count = user_data["cards"].count(card_id)
         count_text = f" (x{card_count})" if card_count > 1 else ""
         
@@ -725,11 +785,10 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML"
         )
 
-# Система обмена
+# Система обмена (без изменений)
 async def start_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     
-    # Проверка блокировки
     if is_banned(user.id):
         await update.message.reply_text("❌ Вы заблокированы в этом боте.")
         return
@@ -744,7 +803,6 @@ async def start_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("📭 У вас нет карточек для обмена!")
         return
 
-    # Показываем коллекцию с ID карточек
     message = await show_collection_with_ids(user.id)
     message += "\n\n🔄 Введите ID карточки, которую хотите обменять:"
     
@@ -754,7 +812,6 @@ async def start_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     
-    # Проверка блокировки
     if is_banned(user.id):
         await update.message.reply_text("❌ Вы заблокированы в этом боте.")
         return
@@ -767,7 +824,6 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if state == "select_your_card":
         try:
             card_id = int(text)
-            # Проверяем, есть ли такая карточка
             if card_id not in user_data.get("cards", []):
                 await update.message.reply_text("❌ У вас нет такой карточки!")
                 return
@@ -788,7 +844,6 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await update.message.reply_text("❌ Нельзя обмениваться с самим собой!")
                 return
                 
-            # Проверка блокировки партнера
             if is_banned(partner_id):
                 await update.message.reply_text("❌ Этот пользователь заблокирован!")
                 return
@@ -805,7 +860,6 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             context.user_data["partner_id"] = partner_id
             context.user_data["trade_state"] = "select_their_card"
             
-            # Показываем коллекцию партнера
             partner_collection = await show_collection_with_ids(partner_id)
             await update.message.reply_text(
                 f"🃏 Коллекция пользователя {partner_id}:\n\n{partner_collection}\n\n"
@@ -821,14 +875,12 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             partner_id = context.user_data["partner_id"]
             partner_data = users.get(str(partner_id), {})
             
-            # Проверяем, есть ли карточка у партнера
             if card_id not in partner_data.get("cards", []):
                 await update.message.reply_text("❌ Этой карточки нет у пользователя!")
                 return
                 
             context.user_data["their_card"] = card_id
             
-            # Получение информации о карточках
             all_cards = load_data(CARDS_FILE, [])
             your_card = next((c for c in all_cards if c["id"] == context.user_data["your_card"]), None)
             their_card = next((c for c in all_cards if c["id"] == card_id), None)
@@ -837,7 +889,6 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await update.message.reply_text("❌ Ошибка данных карточек!")
                 return
             
-            # Сохраняем обмен в файл
             trades = load_data(TRADES_FILE, {})
             trade_id = f"{user.id}_{int(time.time())}"
             trades[trade_id] = {
@@ -849,7 +900,6 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             }
             save_data(TRADES_FILE, trades)
             
-            # Клавиатура подтверждения
             keyboard = [
                 [InlineKeyboardButton("✅ Подтвердить обмен", callback_data=f"confirm_trade_{trade_id}")],
                 [InlineKeyboardButton("❌ Отменить", callback_data="cancel_trade")]
@@ -865,13 +915,11 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except ValueError:
             await update.message.reply_text("❌ Неверный формат ID!")
 
-# Обработка кнопок обмена
 async def trade_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     
-    # Проверка блокировки
     if is_banned(user_id):
         await query.edit_message_text("❌ Вы заблокированы в этом боте.")
         return
@@ -891,7 +939,6 @@ async def trade_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await query.edit_message_text("❌ Предложение об обмене не найдено или устарело!")
             return
             
-        # Отправляем запрос на подтверждение ПАРТНЕРУ
         all_cards = load_data(CARDS_FILE, [])
         your_card = next((c for c in all_cards if c["id"] == trade["from_card"]), None)
         their_card = next((c for c in all_cards if c["id"] == trade["to_card"]), None)
@@ -907,7 +954,6 @@ async def trade_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         try:
-            # Отправляем запрос ПАРТНЕРУ
             await context.bot.send_message(
                 chat_id=trade["to_user"],
                 text=f"🔄 Пользователь @{query.from_user.username} предлагает обмен:\n\n"
@@ -937,7 +983,6 @@ async def trade_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             
             await query.edit_message_text("❌ Вы отклонили предложение об обмене.")
             
-            # Уведомляем первого игрока
             try:
                 await context.bot.send_message(
                     trade["from_user"],
@@ -952,32 +997,26 @@ async def trade_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         from_user_data = users.get(str(trade["from_user"]), {})
         to_user_data = users.get(str(trade["to_user"]), {})
         
-        # Проверяем наличие карточек
         if (trade["from_card"] not in from_user_data.get("cards", []) or 
             trade["to_card"] not in to_user_data.get("cards", [])):
             await query.edit_message_text("❌ Обмен невозможен: карточки больше недоступны!")
             return
             
-        # Обмен карточками
         from_user_data["cards"].remove(trade["from_card"])
         from_user_data["cards"].append(trade["to_card"])
         
         to_user_data["cards"].remove(trade["to_card"])
         to_user_data["cards"].append(trade["from_card"])
         
-        # Сохраняем данные
         users[str(trade["from_user"])] = from_user_data
         users[str(trade["to_user"])] = to_user_data
         save_data(USERS_FILE, users)
         
-        # Обновляем статус обмена
         trades[trade_id]["status"] = "completed"
         save_data(TRADES_FILE, trades)
         
-        # Уведомления
         await query.edit_message_text("✅ Обмен успешно завершен!")
         
-        # Уведомляем первого игрока
         try:
             await context.bot.send_message(
                 trade["from_user"],
@@ -991,7 +1030,6 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     message = update.message
     
-    # Проверка блокировки
     if is_banned(user.id):
         await context.bot.delete_message(chat_id=message.chat_id, message_id=message.message_id)
         warn_msg = await message.reply_text("❌ Вы заблокированы в этом боте.")
@@ -1009,9 +1047,8 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         time.sleep(10)
         await context.bot.delete_message(chat_id=message.chat_id, message_id=warn_msg.message_id)
 
-# ====================== АДМИН И МОДЕРАТОР КОМАНДЫ ====================== #
+# ====================== АДМИН И МОДЕРАТОР КОМАНДЫ (без изменений) ====================== #
 
-# Добавление карточки - начало процесса
 async def admin_addcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
@@ -1020,11 +1057,9 @@ async def admin_addcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await update.message.reply_text("Введите название новой карточки:")
     return ADMIN_CARD_NAME
 
-# Добавление карточки - шаг 1: название
 async def admin_card_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["new_card"] = {"name": update.message.text}
     
-    # Получаем список редкостей
     rarities = load_data(RARITIES_FILE, [])
     if not rarities:
         await update.message.reply_text("❌ Сначала добавьте редкости с помощью /admin_addrarity")
@@ -1038,12 +1073,10 @@ async def admin_card_name(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     return ADMIN_CARD_RARITY
 
-# Добавление карточки - шаг 2: редкость
 async def admin_card_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     rarity = update.message.text.strip()
     rarities = load_data(RARITIES_FILE, [])
     
-    # Проверяем существование редкости
     if rarity not in [r["name"] for r in rarities]:
         await update.message.reply_text("❌ Редкость не найдена! Введите существующую редкость.")
         return ADMIN_CARD_RARITY
@@ -1052,15 +1085,12 @@ async def admin_card_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("Введите описание карточки:")
     return ADMIN_CARD_DESCRIPTION
 
-# Добавление карточки - шаг 3: описание
 async def admin_card_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["new_card"]["description"] = update.message.text
     await update.message.reply_text("Отправьте изображение карточки (фото):")
     return ADMIN_CARD_IMAGE
 
-# Добавление карточки - шаг 4: изображение
 async def admin_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Сохраняем изображение
     if not update.message.photo:
         await update.message.reply_text("❌ Пожалуйста, отправьте изображение карточки!")
         return ADMIN_CARD_IMAGE
@@ -1068,7 +1098,6 @@ async def admin_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     photo = update.message.photo[-1]
     file = await photo.get_file()
     
-    # Создаем папку для изображений, если её нет
     os.makedirs(CARDS_IMAGE_DIR, exist_ok=True)
     
     filename = f"{int(time.time())}.jpg"
@@ -1076,11 +1105,9 @@ async def admin_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     await file.download_to_drive(image_path)
     
-    # Создаем новую карточку
     new_card = context.user_data["new_card"]
     cards = load_data(CARDS_FILE, [])
     
-    # Генерируем ID
     new_id = max(card["id"] for card in cards) + 1 if cards else 1
     new_card["id"] = new_id
     new_card["image"] = filename
@@ -1092,13 +1119,11 @@ async def admin_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data.clear()
     return ConversationHandler.END
 
-# Отмена добавления карточки
 async def cancel_addcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Добавление карточки отменено.")
     context.user_data.clear()
     return ConversationHandler.END
 
-# Список всех карточек
 async def admin_listcards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
@@ -1109,16 +1134,13 @@ async def admin_listcards(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("ℹ️ Карточек нет в базе данных.")
         return
     
-    # Сортируем по ID
     sorted_cards = sorted(cards, key=lambda x: x["id"])
     
-    # Формируем сообщение
     message = "<b>Список всех карточек:</b>\n\n"
     for card in sorted_cards:
         emoji = get_rarity_emoji(card["rarity"])
         message += f"{card['id']}. {html.escape(card['name'])} ({emoji} {card['rarity']})\n"
     
-    # Разбиваем сообщение если слишком длинное
     if len(message) > 4000:
         parts = []
         while message:
@@ -1136,7 +1158,6 @@ async def admin_listcards(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         await update.message.reply_text(message, parse_mode="HTML")
 
-# Сброс таймера пользователя
 async def admin_resettimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1159,7 +1180,6 @@ async def admin_resettimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         
         await update.message.reply_text(f"✅ Таймер пользователя {user_id} сброшен!")
         
-        # Уведомляем пользователя
         try:
             await context.bot.send_message(
                 user_id, 
@@ -1172,7 +1192,6 @@ async def admin_resettimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValueError:
         await update.message.reply_text("❌ Неверный формат ID! Используйте только цифры.")
 
-# Выдача карточки пользователю
 async def admin_givecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1189,20 +1208,17 @@ async def admin_givecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         users = load_data(USERS_FILE, {})
         cards = load_data(CARDS_FILE, [])
         
-        # Проверяем существование карточки
         card = next((c for c in cards if c["id"] == card_id), None)
         if not card:
             await update.message.reply_text("❌ Карточка не найдена!")
             return
         
-        # Добавляем карточку пользователю
         if str(user_id) not in users:
             users[str(user_id)] = {"cards": [], "last_drop": 0}
         
         users[str(user_id)]["cards"].append(card_id)
         save_data(USERS_FILE, users)
         
-        # Получаем количество этой карточки у пользователя
         card_count = users[str(user_id)]["cards"].count(card_id)
         count_text = f" (x{card_count})" if card_count > 1 else ""
         
@@ -1210,7 +1226,6 @@ async def admin_givecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"✅ Карточка '{card['name']}{count_text}' выдана пользователю {user_id}!"
         )
         
-        # Уведомляем пользователя
         try:
             await context.bot.send_message(
                 user_id,
@@ -1225,7 +1240,6 @@ async def admin_givecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except ValueError:
         await update.message.reply_text("❌ Неверный формат ID!")
 
-# Рассылка сообщений
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1245,7 +1259,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     for user_id in users:
         uid = int(user_id)
         if uid in blacklist:
-            continue  # Пропускаем заблокированных
+            continue
             
         try:
             await context.bot.send_message(
@@ -1263,7 +1277,6 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"Ошибок: {errors}"
     )
 
-# Блокировка пользователя
 async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1276,7 +1289,6 @@ async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         user_id = int(context.args[0])
         
-        # Нельзя заблокировать администратора
         if user_id == ADMIN_ID:
             await update.message.reply_text("❌ Нельзя заблокировать администратора!")
             return
@@ -1292,7 +1304,6 @@ async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         
         await update.message.reply_text(f"✅ Пользователь {user_id} заблокирован!")
         
-        # Уведомляем пользователя
         try:
             await context.bot.send_message(
                 user_id,
@@ -1305,7 +1316,6 @@ async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError:
         await update.message.reply_text("❌ Неверный формат ID! Используйте только цифры.")
 
-# Разблокировка пользователя
 async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1328,7 +1338,6 @@ async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         
         await update.message.reply_text(f"✅ Пользователь {user_id} разблокирован!")
         
-        # Уведомляем пользователя
         try:
             await context.bot.send_message(
                 user_id,
@@ -1341,7 +1350,6 @@ async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except ValueError:
         await update.message.reply_text("❌ Неверный формат ID! Используйте только цифры.")
 
-# Добавление модератора
 async def add_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1364,7 +1372,6 @@ async def add_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         
         await update.message.reply_text(f"✅ Пользователь {user_id} теперь модератор!")
         
-        # Уведомляем пользователя
         try:
             await context.bot.send_message(
                 user_id,
@@ -1377,7 +1384,6 @@ async def add_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except ValueError:
         await update.message.reply_text("❌ Неверный формат ID! Используйте только цифры.")
 
-# Удаление модератора
 async def remove_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1400,7 +1406,6 @@ async def remove_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         
         await update.message.reply_text(f"✅ Пользователь {user_id} больше не модератор!")
         
-        # Уведомляем пользователя
         try:
             await context.bot.send_message(
                 user_id,
@@ -1412,7 +1417,6 @@ async def remove_moderator(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValueError:
         await update.message.reply_text("❌ Неверный формат ID! Используйте только цифры.")
 
-# Выдача монет пользователю
 async def admin_givecoins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1433,7 +1437,6 @@ async def admin_givecoins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         new_balance = update_coins(user_id, amount)
         await update.message.reply_text(f"✅ Пользователю {user_id} выдано {amount} монет!\n💰 Новый баланс: {new_balance}")
         
-        # Уведомляем пользователя
         try:
             await context.bot.send_message(
                 user_id,
@@ -1446,7 +1449,6 @@ async def admin_givecoins(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except ValueError:
         await update.message.reply_text("❌ Неверный формат параметров! Используйте только цифры.")
 
-# Изъятие монет у пользователя
 async def admin_removecoins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
@@ -1467,7 +1469,6 @@ async def admin_removecoins(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         new_balance = update_coins(user_id, -amount)
         await update.message.reply_text(f"✅ У пользователя {user_id} изъято {amount} монет!\n💰 Новый баланс: {new_balance}")
         
-        # Уведомляем пользователя
         try:
             await context.bot.send_message(
                 user_id,
@@ -1480,7 +1481,6 @@ async def admin_removecoins(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except ValueError:
         await update.message.reply_text("❌ Неверный формат параметров! Используйте только цифры.")
 
-# Добавление редкости - начало процесса
 async def admin_addrarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
@@ -1489,13 +1489,11 @@ async def admin_addrarity(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("Введите название новой редкости:")
     return ADMIN_RARITY_NAME
 
-# Добавление редкости - шаг 1: название
 async def admin_rarity_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["new_rarity"] = {"name": update.message.text}
     await update.message.reply_text("Введите смайлик для этой редкости:")
     return ADMIN_RARITY_EMOJI
 
-# Добавление редкости - шаг 2: смайлик
 async def admin_rarity_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["new_rarity"]["emoji"] = update.message.text
     await update.message.reply_text(
@@ -1504,7 +1502,6 @@ async def admin_rarity_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     return ADMIN_RARITY_DROPPABLE
 
-# Добавление редкости - шаг 3: droppable флаг
 async def admin_rarity_droppable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         droppable = int(update.message.text)
@@ -1529,13 +1526,11 @@ async def admin_rarity_droppable(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data.clear()
     return ConversationHandler.END
 
-# Отмена добавления редкости
 async def cancel_addrarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Добавление редкости отменено.")
     context.user_data.clear()
     return ConversationHandler.END
 
-# Список всех редкостей
 async def admin_listrarities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
@@ -1555,7 +1550,6 @@ async def admin_listrarities(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     await update.message.reply_text(message, parse_mode="HTML")
 
-# Добавление товара в магазин - начало процесса
 async def admin_addshopitem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
@@ -1564,7 +1558,6 @@ async def admin_addshopitem(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("Введите название товара:")
     return ADMIN_SHOP_NAME
 
-# Добавление товара - шаг 1: название
 async def admin_shop_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["new_shop_item"] = {"name": update.message.text}
     
@@ -1580,7 +1573,6 @@ async def admin_shop_name(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     return ADMIN_SHOP_TYPE
 
-# Обработка типа товара
 async def admin_shop_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -1594,7 +1586,6 @@ async def admin_shop_type(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     return ADMIN_SHOP_PRICE
 
-# Добавление товара - шаг 2: цена
 async def admin_shop_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         price = int(update.message.text)
@@ -1607,7 +1598,6 @@ async def admin_shop_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["new_shop_item"]["price"] = price
     
     if context.user_data["new_shop_item"]["type"] == "reset":
-        # Для сброса таймера не нужны карточки
         await update.message.reply_text(
             "Введите продолжительность действия товара в часах (0 - бессрочно):\n"
             "Пример: 24 - товар будет доступен 24 часа"
@@ -1620,7 +1610,6 @@ async def admin_shop_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return ADMIN_SHOP_CARDS
 
-# Добавление товара - шаг 3: карточки (для набора)
 async def admin_shop_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         card_ids = [int(id_str) for id_str in update.message.text.split()]
@@ -1628,7 +1617,6 @@ async def admin_shop_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Неверный формат ID! Используйте цифры, разделенные пробелами.")
         return ADMIN_SHOP_CARDS
     
-    # Проверяем существование карточек
     cards = load_data(CARDS_FILE, [])
     existing_ids = [card["id"] for card in cards]
     
@@ -1644,7 +1632,6 @@ async def admin_shop_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     return ADMIN_SHOP_DURATION
 
-# Добавление товара - шаг 4: продолжительность
 async def admin_shop_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         duration = float(update.message.text)
@@ -1657,20 +1644,17 @@ async def admin_shop_duration(update: Update, context: ContextTypes.DEFAULT_TYPE
     new_item = context.user_data["new_shop_item"]
     shop_items = load_data(SHOP_FILE, [])
     
-    # Устанавливаем время истечения
     if duration > 0:
         new_item["expire_time"] = time.time() + duration * 3600
     else:
         new_item["expire_time"] = 0
     
-    # Генерируем ID
     new_id = max(item["id"] for item in shop_items) + 1 if shop_items else 1
     new_item["id"] = new_id
     
     shop_items.append(new_item)
     save_data(SHOP_FILE, shop_items)
     
-    # Формируем сообщение
     message = f"✅ Товар '{html.escape(new_item['name'])}' успешно добавлен в магазин!\n"
     message += f"💵 Цена: {new_item['price']} монет\n"
     message += f"📝 Тип: {'Сброс таймера' if new_item['type'] == 'reset' else 'Набор карточек'}\n"
@@ -1690,13 +1674,11 @@ async def admin_shop_duration(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear()
     return ConversationHandler.END
 
-# Отмена добавления товара
 async def cancel_addshopitem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Добавление товара отменено.")
     context.user_data.clear()
     return ConversationHandler.END
 
-# Список товаров в магазине (для админа)
 async def admin_listshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
@@ -1705,13 +1687,11 @@ async def admin_listshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     shop_items = load_data(SHOP_FILE, [])
     current_time = time.time()
     
-    # Удаляем просроченные товары
     active_items = [
         item for item in shop_items 
         if item.get("expire_time", 0) == 0 or item["expire_time"] > current_time
     ]
     
-    # Обновляем файл магазина
     save_data(SHOP_FILE, active_items)
     
     if not active_items:
@@ -1724,7 +1704,6 @@ async def admin_listshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         message += f"🏷 <b>Название</b>: {html.escape(item['name'])}\n"
         message += f"💵 <b>Цена</b>: {item['price']} монет\n"
         
-        # Отображаем время до истечения
         if item.get("expire_time", 0) > 0:
             time_left = item["expire_time"] - current_time
             if time_left > 0:
@@ -1732,7 +1711,7 @@ async def admin_listshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 minutes = int((time_left % 3600) // 60)
                 message += f"⏳ <b>Осталось</b>: {hours}ч {minutes}мин\n"
             else:
-                continue  # Пропускаем просроченные
+                continue
         
         if item["type"] == "reset":
             message += "📝 <b>Тип</b>: Сброс таймера получения карточки\n\n"
@@ -1743,7 +1722,6 @@ async def admin_listshop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     await update.message.reply_text(message, parse_mode="HTML")
 
-# Редактирование карточки
 async def admin_editcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
@@ -1784,7 +1762,6 @@ async def admin_editcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("❌ Неверный формат ID! Используйте только цифры.")
         return ConversationHandler.END
 
-# Обработка выбора поля для изменения
 async def edit_card_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -1804,14 +1781,12 @@ async def edit_card_field(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     return EDIT_CARD_VALUE
 
-# Обработка нового значения
 async def edit_card_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_data = context.user_data
     field = user_data["edit_field"]
     card_id = user_data["card_id"]
     cards = load_data(CARDS_FILE, [])
     
-    # Находим карточку
     card_index = next((i for i, c in enumerate(cards) if c["id"] == card_id), -1)
     if card_index == -1:
         await update.message.reply_text("❌ Карточка не найдена!")
@@ -1826,7 +1801,6 @@ async def edit_card_value(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         photo = update.message.photo[-1]
         file = await photo.get_file()
         
-        # Создаем папку для изображений, если её нет
         os.makedirs(CARDS_IMAGE_DIR, exist_ok=True)
         
         filename = f"{int(time.time())}.jpg"
@@ -1834,7 +1808,6 @@ async def edit_card_value(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         await file.download_to_drive(image_path)
         
-        # Удаляем старое изображение
         old_image = cards[card_index]["image"]
         old_path = os.path.join(CARDS_IMAGE_DIR, old_image)
         if os.path.exists(old_path):
@@ -1856,19 +1829,16 @@ async def edit_card_value(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data.clear()
     return ConversationHandler.END
 
-# Отмена редактирования карточки
 async def cancel_editcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Изменение карточки отменено.")
     context.user_data.clear()
     return ConversationHandler.END
 
-# ====================== КРАФТ КАРТОЧЕК ====================== #
+# ====================== КРАФТ КАРТОЧЕК (без изменений) ====================== #
 
-# Начало процесса крафта
 async def start_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     
-    # Проверка блокировки
     if is_banned(user.id):
         await update.message.reply_text("❌ Вы заблокированы в этом боте.")
         return ConversationHandler.END
@@ -1885,7 +1855,6 @@ async def start_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text("❌ У вас менее 3 карточек в коллекции!")
         return ConversationHandler.END
         
-    # Показываем коллекцию
     message = await show_collection_with_ids(user.id)
     message += "\n\n🛠 <b>Система крафта</b>\n" \
                "Выберите 3 карточки ОДНОЙ редкости (Обычная или Редкая) для улучшения.\n" \
@@ -1894,7 +1863,6 @@ async def start_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await update.message.reply_text(message, parse_mode="HTML")
     return CRAFT_SELECT_CARDS
 
-# Обработка выбора карточек для крафта
 async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = update.message.text
@@ -1911,13 +1879,11 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user_data = users.get(str(user.id), {})
     user_cards = user_data.get("cards", [])
     
-    # Проверяем наличие карточек у пользователя
     missing_cards = [card_id for card_id in card_ids if card_id not in user_cards]
     if missing_cards:
         await update.message.reply_text(f"❌ У вас нет карточек с ID: {', '.join(map(str, missing_cards))}")
         return CRAFT_SELECT_CARDS
         
-    # Проверяем редкости карточек
     cards_data = load_data(CARDS_FILE, [])
     selected_cards = [c for c in cards_data if c["id"] in card_ids]
     rarities = set(card["rarity"] for card in selected_cards)
@@ -1931,18 +1897,14 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Крафт доступен только для карточек Обычной и Редкой редкости!")
         return CRAFT_SELECT_CARDS
         
-    # Определяем новую редкость
     new_rarity = "Редкая" if rarity == "Обычная" else "Эпическая"
     
-    # Шанс успеха: 70%
     success = random.random() < 0.4
     
-    # Удаляем карточки у пользователя
     for card_id in card_ids:
         user_cards.remove(card_id)
     
     if success:
-        # Выбираем случайную карточку новой редкости
         new_cards = [c for c in cards_data if c["rarity"] == new_rarity]
         if not new_cards:
             await update.message.reply_text("❌ Ошибка: нет карточек нужной редкости!")
@@ -1951,12 +1913,10 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         new_card = random.choice(new_cards)
         user_cards.append(new_card["id"])
         
-        # Сохраняем изменения
         user_data["cards"] = user_cards
         users[str(user.id)] = user_data
         save_data(USERS_FILE, users)
         
-        # Получаем количество новой карточки
         card_count = user_cards.count(new_card["id"])
         count_text = f" (x{card_count})" if card_count > 1 else ""
         
@@ -1966,7 +1926,6 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             f"📚 Теперь в вашей коллекции: {len(user_cards)} карточек"
         )
     else:
-        # Сохраняем изменения (карточки уже удалены)
         user_data["cards"] = user_cards
         users[str(user.id)] = user_data
         save_data(USERS_FILE, users)
@@ -1979,29 +1938,25 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     return ConversationHandler.END
 
-# Отмена крафта
 async def cancel_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Крафт отменен.")
     context.user_data.clear()
     return ConversationHandler.END
 
-# ====================== ТАБЛИЦА ЛИДЕРОВ ====================== #
+# ====================== ТАБЛИЦА ЛИДЕРОВ (без изменений) ====================== #
 
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     
-    # Проверка блокировки
     if is_banned(user.id):
         return
         
     if not await is_subscribed(user.id, context):
         return
 
-    # Получаем списки администраторов и модераторов
     moderators = load_data(MODERATORS_FILE, [])
     exclude_ids = [ADMIN_ID] + moderators
     
-    # Топ по монетам
     coins_data = load_data(COINS_FILE, {})
     coins_leaders = []
     for user_id, coins in coins_data.items():
@@ -2012,7 +1967,6 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     coins_leaders.sort(key=lambda x: x[1], reverse=True)
     coins_top = coins_leaders[:5]
     
-    # Топ по редким карточкам
     users_data = load_data(USERS_FILE, {})
     cards_data = load_data(CARDS_FILE, [])
     rare_cards = [card["id"] for card in cards_data if card["rarity"] in ["Легендарная", "Эксклюзивная"]]
@@ -2028,7 +1982,6 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     rare_leaders.sort(key=lambda x: x[1], reverse=True)
     rare_top = rare_leaders[:5]
     
-    # Формируем сообщение
     message = "<b>🏆 Таблица лидеров</b>\n\n"
     
     message += "<b>💰 Топ по монетам:</b>\n"
@@ -2056,6 +2009,399 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         message += "Нет данных\n"
     
     await update.message.reply_text(message, parse_mode="HTML")
+
+# ====================== НОВЫЕ КОМАНДЫ: КАЗИНО, МОНЕТКА, БАФФЫ ====================== #
+
+# КАЗИНО
+async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+        
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /casino <сумма>")
+        return
+        
+    try:
+        bet = int(context.args[0])
+        if bet <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите положительное число.")
+        return
+    
+    balance = get_coins(user.id)
+    if balance < bet:
+        await update.message.reply_text("❌ Недостаточно монет!")
+        return
+    
+    # Множители: 0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2
+    multipliers = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+    multiplier = random.choice(multipliers)
+    win = int(bet * multiplier)
+    
+    if win > 0:
+        new_balance = update_coins(user.id, win - bet)  # уже учтём, что ставка списана
+        # Но мы ещё не списали ставку. Лучше списать ставку, потом добавить выигрыш.
+        update_coins(user.id, -bet)  # списываем ставку
+        if win > 0:
+            update_coins(user.id, win)  # добавляем выигрыш
+        new_balance = get_coins(user.id)
+        result_text = f"🎉 Вы выиграли! Множитель: x{multiplier:.2f}\nВыигрыш: +{win} монет"
+    else:
+        update_coins(user.id, -bet)
+        new_balance = get_coins(user.id)
+        result_text = f"😞 Вы проиграли. Множитель: x{multiplier:.2f}\nПотеряно: -{bet} монет"
+    
+    await update.message.reply_text(
+        f"🎰 <b>Казино</b>\n\n"
+        f"Ставка: {bet} монет\n"
+        f"Множитель: x{multiplier:.2f}\n"
+        f"{result_text}\n"
+        f"💰 Новый баланс: {new_balance} монет",
+        parse_mode="HTML"
+    )
+
+# МОНЕТКА
+async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+        
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("ℹ️ Использование: /coin <орел|решка> <сумма>")
+        return
+        
+    choice = context.args[0].lower()
+    if choice not in ["орел", "решка"]:
+        await update.message.reply_text("❌ Выберите 'орел' или 'решка'.")
+        return
+        
+    try:
+        bet = int(context.args[1])
+        if bet <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите положительное число.")
+        return
+    
+    balance = get_coins(user.id)
+    if balance < bet:
+        await update.message.reply_text("❌ Недостаточно монет!")
+        return
+    
+    # Шансы: 40% орел, 40% решка, 10% ребро
+    rand = random.random()
+    if rand < 0.4:
+        result = "орел"
+    elif rand < 0.8:
+        result = "решка"
+    else:
+        result = "ребро"
+    
+    # Обработка
+    if result == "ребро":
+        # возврат ставки
+        update_coins(user.id, 0)  # ничего не меняем
+        new_balance = get_coins(user.id)
+        await update.message.reply_text(
+            f"🪙 <b>Монетка</b>\n\n"
+            f"Ваш выбор: {choice}\n"
+            f"Выпало: ребро!\n"
+            f"💰 Ставка возвращена. Баланс: {new_balance} монет",
+            parse_mode="HTML"
+        )
+        return
+    
+    if result == choice:
+        # выигрыш: удвоение ставки
+        update_coins(user.id, -bet)  # списываем ставку
+        update_coins(user.id, bet * 2)  # добавляем выигрыш (ставка*2)
+        new_balance = get_coins(user.id)
+        await update.message.reply_text(
+            f"🪙 <b>Монетка</b>\n\n"
+            f"Ваш выбор: {choice}\n"
+            f"Выпало: {result}!\n"
+            f"🎉 Вы выиграли! +{bet*2} монет\n"
+            f"💰 Новый баланс: {new_balance} монет",
+            parse_mode="HTML"
+        )
+    else:
+        # проигрыш
+        update_coins(user.id, -bet)
+        new_balance = get_coins(user.id)
+        await update.message.reply_text(
+            f"🪙 <b>Монетка</b>\n\n"
+            f"Ваш выбор: {choice}\n"
+            f"Выпало: {result}!\n"
+            f"😞 Вы проиграли. -{bet} монет\n"
+            f"💰 Новый баланс: {new_balance} монет",
+            parse_mode="HTML"
+        )
+
+# БАФФЫ: просмотр текущего баффа
+async def buff_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+        
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+
+    buff = get_active_buff(user.id)
+    if not buff:
+        await update.message.reply_text(
+            "❌ У вас нет активной карты баффа.\n"
+            "Чтобы выбрать карту, используйте /set_buff <card_id>"
+        )
+        return
+    
+    card_id = buff["card_id"]
+    level = buff["level"]
+    
+    cards = load_data(CARDS_FILE, [])
+    card = next((c for c in cards if c["id"] == card_id), None)
+    if not card:
+        await update.message.reply_text("❌ Активная карта больше не существует в базе. Очистите бафф.")
+        return
+    
+    cooldown_reduction = min(level * 5, 80)
+    coin_bonus = level * 5
+    current_cooldown_hours = 6 * (1 - cooldown_reduction / 100)
+    
+    message = (
+        f"🃏 <b>Ваш активный бафф</b>\n\n"
+        f"Карта: {card['name']} (ID: {card_id})\n"
+        f"Редкость: {card['rarity']}\n"
+        f"Уровень: {level}\n\n"
+        f"<b>Эффекты:</b>\n"
+        f"⏳ Уменьшение кулдауна: -{cooldown_reduction}% (текущий кулдаун: {current_cooldown_hours:.1f} ч)\n"
+        f"💰 Бонус к монетам: +{coin_bonus}%\n\n"
+        f"Чтобы улучшить бафф, используйте /upgrade_buff (потребуются копии карты)"
+    )
+    await update.message.reply_text(message, parse_mode="HTML")
+
+# БАФФЫ: установка активной карты
+async def set_buff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+        
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /set_buff <card_id>")
+        return
+        
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат ID! Используйте только цифры.")
+        return
+    
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user.id), {})
+    user_cards = user_data.get("cards", [])
+    
+    if card_id not in user_cards:
+        await update.message.reply_text("❌ У вас нет такой карточки в коллекции!")
+        return
+    
+    cards = load_data(CARDS_FILE, [])
+    card = next((c for c in cards if c["id"] == card_id), None)
+    if not card:
+        await update.message.reply_text("❌ Карточка не найдена в базе!")
+        return
+    
+    if not is_legendary_or_higher(card["rarity"]):
+        await update.message.reply_text("❌ Для баффа можно выбрать только карту редкости Легендарная, Блещет умом или Эксклюзивная!")
+        return
+    
+    # Если уже есть активная карта, спросим подтверждение (можно просто заменить)
+    current_buff = get_active_buff(user.id)
+    if current_buff:
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, заменить", callback_data=f"confirm_set_buff_{card_id}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_set_buff")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"У вас уже есть активная карта баффа. Заменить её на '{card['name']}'?",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Устанавливаем новый бафф
+    set_active_buff(user.id, card_id)
+    await update.message.reply_text(
+        f"✅ Карта '{card['name']}' теперь активна как бафф (уровень 1)!\n"
+        "Посмотреть эффекты: /buff"
+    )
+
+# Обработчик кнопок для установки баффа
+async def set_buff_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    data = query.data
+    if data == "cancel_set_buff":
+        await query.edit_message_text("❌ Замена баффа отменена.")
+        return
+    
+    if data.startswith("confirm_set_buff_"):
+        card_id = int(data[len("confirm_set_buff_"):])
+        # Проверяем, что карта все еще есть
+        users = load_data(USERS_FILE, {})
+        user_data = users.get(str(user_id), {})
+        if card_id not in user_data.get("cards", []):
+            await query.edit_message_text("❌ У вас больше нет этой карточки!")
+            return
+        
+        cards = load_data(CARDS_FILE, [])
+        card = next((c for c in cards if c["id"] == card_id), None)
+        if not card:
+            await query.edit_message_text("❌ Карточка не найдена!")
+            return
+        
+        set_active_buff(user_id, card_id)
+        await query.edit_message_text(
+            f"✅ Карта '{card['name']}' теперь активна как бафф (уровень 1)!\n"
+            "Посмотреть эффекты: /buff"
+        )
+
+# БАФФЫ: улучшение активной карты
+async def upgrade_buff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+        
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+
+    buff = get_active_buff(user.id)
+    if not buff:
+        await update.message.reply_text("❌ У вас нет активной карты баффа. Выберите с помощью /set_buff")
+        return
+    
+    card_id = buff["card_id"]
+    current_level = buff["level"]
+    required_cards = current_level + 1  # для перехода с L на L+1 нужно L+1 карт
+    
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user.id), {})
+    user_cards = user_data.get("cards", [])
+    
+    # Сколько копий этой карты у пользователя (не считая активную? активная не входит в коллекцию? она есть в коллекции, но мы должны учитывать, что активная тоже есть в списке)
+    # При улучшении мы будем тратить карты из коллекции, но активная не должна быть удалена.
+    # Поэтому посчитаем общее количество карт этого типа в коллекции.
+    total_copies = user_cards.count(card_id)
+    
+    # Для улучшения нужно, чтобы total_copies >= required_cards + 1? Нет, активная уже есть, и она входит в total_copies.
+    # Чтобы улучшить, нам нужно потратить required_cards карт (не активную). То есть нам нужно total_copies - 1 (активная) >= required_cards.
+    # То есть total_copies >= required_cards + 1.
+    available_for_upgrade = total_copies - 1  # минус активная
+    
+    if available_for_upgrade < required_cards:
+        await update.message.reply_text(
+            f"❌ Недостаточно копий для улучшения.\n"
+            f"Текущий уровень: {current_level}\n"
+            f"Для улучшения до уровня {current_level+1} нужно потратить {required_cards} копий.\n"
+            f"У вас есть {available_for_upgrade} доступных копий (всего {total_copies} карт этого типа)."
+        )
+        return
+    
+    # Подтверждение
+    keyboard = [
+        [InlineKeyboardButton("✅ Улучшить", callback_data=f"confirm_upgrade_buff")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_upgrade_buff")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        f"🔄 Вы собираетесь улучшить бафф карты '{card_id}' с уровня {current_level} до {current_level+1}.\n"
+        f"Будет потрачено {required_cards} копий этой карты.\n"
+        f"Подтверждаете?",
+        reply_markup=reply_markup
+    )
+
+async def upgrade_buff_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    data = query.data
+    if data == "cancel_upgrade_buff":
+        await query.edit_message_text("❌ Улучшение баффа отменено.")
+        return
+    
+    if data == "confirm_upgrade_buff":
+        buff = get_active_buff(user_id)
+        if not buff:
+            await query.edit_message_text("❌ У вас больше нет активной карты баффа.")
+            return
+        
+        card_id = buff["card_id"]
+        current_level = buff["level"]
+        required_cards = current_level + 1
+        
+        users = load_data(USERS_FILE, {})
+        user_data = users.get(str(user_id), {})
+        user_cards = user_data.get("cards", [])
+        
+        total_copies = user_cards.count(card_id)
+        if total_copies < required_cards + 1:
+            await query.edit_message_text("❌ Недостаточно копий для улучшения.")
+            return
+        
+        # Удаляем required_cards копий (но не активную)
+        removed = 0
+        new_cards = []
+        for cid in user_cards:
+            if cid == card_id and removed < required_cards:
+                removed += 1
+                continue
+            new_cards.append(cid)
+        
+        if removed != required_cards:
+            await query.edit_message_text("❌ Ошибка при удалении карт.")
+            return
+        
+        # Обновляем коллекцию
+        user_data["cards"] = new_cards
+        users[str(user_id)] = user_data
+        save_data(USERS_FILE, users)
+        
+        # Повышаем уровень баффа
+        new_level = current_level + 1
+        update_buff_level(user_id, new_level)
+        
+        await query.edit_message_text(
+            f"✅ Бафф улучшен до уровня {new_level}!\n"
+            f"Потрачено {required_cards} копий карты.\n"
+            f"Посмотреть эффекты: /buff"
+        )
 
 # ====================== ОСНОВНАЯ ФУНКЦИЯ ====================== #
 
@@ -2112,7 +2458,6 @@ def main() -> None:
         save_data(COINS_FILE, {})
     
     if not os.path.exists(RARITIES_FILE):
-        # Стандартные редкости
         save_data(RARITIES_FILE, [
             {"name": "Легендарная", "emoji": "🔥", "droppable": True},
             {"name": "Блещет умом", "emoji": "🧠", "droppable": True},
@@ -2217,9 +2562,18 @@ def main() -> None:
     application.add_handler(CommandHandler("admin_listrarities", admin_listrarities))
     application.add_handler(CommandHandler("admin_listshop", admin_listshop))
     
+    # НОВЫЕ КОМАНДЫ
+    application.add_handler(CommandHandler("casino", casino))
+    application.add_handler(CommandHandler("coin", coin_flip))
+    application.add_handler(CommandHandler("buff", buff_info))
+    application.add_handler(CommandHandler("set_buff", set_buff))
+    application.add_handler(CommandHandler("upgrade_buff", upgrade_buff))
+    
     # Обработчики кнопок
     application.add_handler(CallbackQueryHandler(trade_button, pattern=r"^(confirm_trade_|accept_trade_|reject_trade_|cancel_trade)"))
     application.add_handler(CallbackQueryHandler(admin_shop_type, pattern=r"^(reset|pack)"))
+    application.add_handler(CallbackQueryHandler(set_buff_buttons, pattern=r"^(confirm_set_buff_|cancel_set_buff)"))
+    application.add_handler(CallbackQueryHandler(upgrade_buff_buttons, pattern=r"^(confirm_upgrade_buff|cancel_upgrade_buff)"))
     
     # Обработчики сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_trade))
