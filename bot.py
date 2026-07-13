@@ -16,13 +16,13 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# Конфигурация
+# ============================ КОНФИГУРАЦИЯ ============================
 TOKEN = input("Введите токен бота: ")
 CHANNEL_ID = "-1002899939309"
 CHANNEL_LINK = "https://t.me/cabakoff"
 ADMIN_ID = 1106828306
 
-# Пути к файлам
+# ============================ ПУТИ К ФАЙЛАМ ============================
 CARDS_FILE = "cards.json"
 USERS_FILE = "users.json"
 TRADES_FILE = "trades.json"
@@ -33,28 +33,31 @@ RARITIES_FILE = "rarities.json"
 SHOP_FILE = "shop.json"
 PROMOCODES_FILE = "promocodes.json"
 SUGGESTIONS_FILE = "suggestions.json"
+EVENTS_FILE = "events.json"
+BETS_FILE = "bets.json"
 CARDS_IMAGE_DIR = "cards_images"
 
-# Состояния для добавления карточек
+# ============================ СОСТОЯНИЯ ============================
 ADMIN_CARD_NAME, ADMIN_CARD_RARITY, ADMIN_CARD_DESCRIPTION, ADMIN_CARD_IMAGE = range(4)
 ADMIN_SHOP_NAME, ADMIN_SHOP_TYPE, ADMIN_SHOP_PRICE, ADMIN_SHOP_CARDS, ADMIN_SHOP_DURATION = range(5)
 ADMIN_RARITY_NAME, ADMIN_RARITY_EMOJI, ADMIN_RARITY_DROPPABLE = range(3)
 EDIT_CARD_SELECT, EDIT_CARD_FIELD, EDIT_CARD_VALUE = range(3)
 CRAFT_SELECT_CARDS = range(1)
 
-# Состояния для промокодов
+# Промокоды
 PROMO_NAME, PROMO_TYPE, PROMO_VALUE, PROMO_USES, PROMO_DURATION = range(5)
 
-# Состояния для предложения карточки
+# Предложение карточки
 SUGGEST_NAME, SUGGEST_DESCRIPTION, SUGGEST_IMAGE = range(3)
 
-# Настройка логгирования
+# ============================ ЛОГГИРОВАНИЕ ============================
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 def load_data(filename, default=None):
     if default is None:
         default = {}
@@ -179,7 +182,7 @@ def set_coin_streak(user_id: int, streak: int):
     users[str(user_id)] = user_data
     save_data(USERS_FILE, users)
 
-# ================== БАФФЫ ==================
+# ============================ БАФФЫ ============================
 def get_active_buff(user_id: int):
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user_id), {})
@@ -227,7 +230,18 @@ def get_coin_bonus_multiplier(user_id: int) -> float:
 def is_legendary_or_higher(rarity: str) -> bool:
     return rarity in ["Легендарная", "Блещет умом", "Эксклюзивная"]
 
-# ================== СТАРЫЕ КОМАНДЫ (ПОЛНОСТЬЮ) ==================
+# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОФИЛЯ ========================
+def add_seen_card(user_id: int, card_id: int):
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    if "seen_cards" not in user_data:
+        user_data["seen_cards"] = []
+    if card_id not in user_data["seen_cards"]:
+        user_data["seen_cards"].append(card_id)
+        users[str(user_id)] = user_data
+        save_data(USERS_FILE, users)
+
+# ============================ ОСНОВНЫЕ КОМАНДЫ ============================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -249,7 +263,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "last_drop": 0,
             "username": user.username,
             "casino_streak": 0,
-            "coin_streak": 0
+            "coin_streak": 0,
+            "seen_cards": []
         }
         save_data(USERS_FILE, users)
         coins_data = load_data(COINS_FILE, {})
@@ -276,13 +291,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/admin_listshop - список товаров\n"
                 "/admin_editcard <card_id> - изменить карточку\n"
                 "/create_promo - создать промокод\n"
-                "/casino <сумма> - сыграть в казино\n"
-                "/coin <орел|решка> <сумма> - подбросить монетку\n"
-                "/buff - информация о баффе\n"
-                "/set_buff <card_id> - выбрать карту для баффа\n"
-                "/upgrade_buff - улучшить бафф\n"
-                "/suggest_card - предложить карточку\n"
-                "/redeem <код> - активировать промокод"
+                "/create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ> - создать матч\n"
+                "/finish_match <match_id> <счёт> - завершить матч (например 3:1)"
             )
         elif is_moderator(user.id):
             await update.message.reply_text(
@@ -295,13 +305,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/admin_listshop - список товаров\n"
                 "/admin_editcard <card_id> - изменить карточку\n"
                 "/create_promo - создать промокод\n"
-                "/casino <сумма> - сыграть в казино\n"
-                "/coin <орел|решка> <сумма> - подбросить монетку\n"
-                "/buff - информация о баффе\n"
-                "/set_buff <card_id> - выбрать карту для баффа\n"
-                "/upgrade_buff - улучшить бафф\n"
-                "/suggest_card - предложить карточку\n"
-                "/redeem <код> - активировать промокод"
+                "/create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ> - создать матч\n"
+                "/finish_match <match_id> <счёт> - завершить матч"
             )
         else:
             await context.bot.send_message(
@@ -325,7 +330,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/set_buff <card_id> - выбрать карту для баффа\n"
                 "/upgrade_buff - улучшить бафф\n"
                 "/suggest_card - предложить карточку\n"
-                "/redeem <код> - активировать промокод\n\n"
+                "/redeem <код> - активировать промокод\n"
+                "/profile - ваш профиль\n"
+                "/bet - сделать ставку (инлайн-меню)\n"
+                "/my_bets - мои ставки\n\n"
                 "⏳ Карточку можно получать каждые 6 часов!"
             )
     else:
@@ -334,6 +342,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_data["casino_streak"] = 0
         if "coin_streak" not in user_data:
             user_data["coin_streak"] = 0
+        if "seen_cards" not in user_data:
+            user_data["seen_cards"] = []
         users[str(user.id)] = user_data
         save_data(USERS_FILE, users)
         if is_admin(user.id):
@@ -356,13 +366,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/admin_listshop - список товаров\n"
                 "/admin_editcard <card_id> - изменить карточку\n"
                 "/create_promo - создать промокод\n"
-                "/casino <сумма> - сыграть в казино\n"
-                "/coin <орел|решка> <сумма> - подбросить монетку\n"
-                "/buff - информация о баффе\n"
-                "/set_buff <card_id> - выбрать карту для баффа\n"
-                "/upgrade_buff - улучшить бафф\n"
-                "/suggest_card - предложить карточку\n"
-                "/redeem <код> - активировать промокод"
+                "/create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ> - создать матч\n"
+                "/finish_match <match_id> <счёт> - завершить матч"
             )
         elif is_moderator(user.id):
             await update.message.reply_text(
@@ -375,13 +380,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/admin_listshop - список товаров\n"
                 "/admin_editcard <card_id> - изменить карточку\n"
                 "/create_promo - создать промокод\n"
-                "/casino <сумма> - сыграть в казино\n"
-                "/coin <орел|решка> <сумма> - подбросить монетку\n"
-                "/buff - информация о баффе\n"
-                "/set_buff <card_id> - выбрать карту для баффа\n"
-                "/upgrade_buff - улучшить бафф\n"
-                "/suggest_card - предложить карточку\n"
-                "/redeem <код> - активировать промокод"
+                "/create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ> - создать матч\n"
+                "/finish_match <match_id> <счёт> - завершить матч"
             )
         else:
             await update.message.reply_text(
@@ -401,11 +401,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "/set_buff <card_id> - выбрать карту для баффа\n"
                 "/upgrade_buff - улучшить бафф\n"
                 "/suggest_card - предложить карточку\n"
-                "/redeem <код> - активировать промокод\n\n"
+                "/redeem <код> - активировать промокод\n"
+                "/profile - ваш профиль\n"
+                "/bet - сделать ставку (инлайн-меню)\n"
+                "/my_bets - мои ставки\n\n"
                 "⏳ Карточку можно получать каждые 6 часов!"
             )
 
-# Выдача карточки (с баффами)
+# Выдача карточки (с баффами и seen_cards)
 async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if is_banned(user.id):
@@ -468,6 +471,7 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_data["cards"] = []
     user_data["cards"].append(card["id"])
     user_data["last_drop"] = current_time
+    add_seen_card(user.id, card["id"])
     users[str(user.id)] = user_data
     save_data(USERS_FILE, users)
 
@@ -662,6 +666,7 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_data["cards"] = []
         card_id = random.choice(item["cards"])
         user_data["cards"].append(card_id)
+        add_seen_card(user.id, card_id)
         users[str(user.id)] = user_data
         save_data(USERS_FILE, users)
         cards = load_data(CARDS_FILE, [])
@@ -900,7 +905,7 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         time.sleep(10)
         await context.bot.delete_message(chat_id=message.chat_id, message_id=warn_msg.message_id)
 
-# ================== АДМИН-КОМАНДЫ ==================
+# ============================ АДМИН-КОМАНДЫ ============================
 async def admin_addcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
@@ -1009,7 +1014,7 @@ async def admin_resettimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"✅ Таймер пользователя {user_id} сброшен!")
         try:
             await context.bot.send_message(
-                user_id, 
+                user_id,
                 "⏱ Администратор сбросил ваш таймер!\n"
                 "Теперь вы можете получить новую карточку сразу с помощью /get_card"
             )
@@ -1536,7 +1541,7 @@ async def cancel_editcard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data.clear()
     return ConversationHandler.END
 
-# ================== КРАФТ ==================
+# ============================ КРАФТ ============================
 async def start_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     if is_banned(user.id):
@@ -1622,7 +1627,7 @@ async def cancel_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data.clear()
     return ConversationHandler.END
 
-# ================== ТАБЛИЦА ЛИДЕРОВ ==================
+# ============================ ТАБЛИЦА ЛИДЕРОВ ============================
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if is_banned(user.id):
@@ -1676,9 +1681,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         message += "Нет данных\n"
     await update.message.reply_text(message, parse_mode="HTML")
 
-# ================== НОВЫЕ КОМАНДЫ: КАЗИНО, МОНЕТКА, ПРОМОКОДЫ, ПРЕДЛОЖЕНИЯ, БАФФЫ ==================
-
-# КАЗИНО
+# ============================ КАЗИНО ============================
 async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if is_banned(user.id):
@@ -1733,7 +1736,7 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML"
         )
 
-# МОНЕТКА
+# ============================ МОНЕТКА ============================
 async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if is_banned(user.id):
@@ -1761,7 +1764,6 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Недостаточно монет!")
         return
     streak = get_coin_streak(user.id)
-    # 10% ребро
     if random.random() < 0.1:
         new_balance = get_coins(user.id)
         await update.message.reply_text(
@@ -1772,7 +1774,6 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML"
         )
         return
-    # Шанс угадать уменьшается от streak
     win_chance = max(0.1, 0.5 - streak * 0.05)
     if random.random() < win_chance:
         result = choice
@@ -1804,272 +1805,7 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML"
         )
 
-# ПРОМОКОДЫ
-async def create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not has_admin_access(update.effective_user.id):
-        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
-        return ConversationHandler.END
-    await update.message.reply_text("Введите код промокода (латиница, без пробелов):")
-    return PROMO_NAME
-
-async def promo_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    code = update.message.text.strip()
-    if " " in code:
-        await update.message.reply_text("❌ Код не должен содержать пробелов. Введите снова:")
-        return PROMO_NAME
-    promos = load_data(PROMOCODES_FILE, {})
-    if code in promos:
-        await update.message.reply_text("❌ Такой промокод уже существует. Введите другой:")
-        return PROMO_NAME
-    context.user_data["promo_code"] = code
-    await update.message.reply_text("Выберите тип награды:\n1 - монеты\n2 - сброс таймера")
-    return PROMO_TYPE
-
-async def promo_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if text == "1":
-        promo_type = "coins"
-    elif text == "2":
-        promo_type = "reset"
-    else:
-        await update.message.reply_text("❌ Введите 1 или 2.")
-        return PROMO_TYPE
-    context.user_data["promo_type"] = promo_type
-    if promo_type == "coins":
-        await update.message.reply_text("Введите количество монет для начисления:")
-    else:
-        await update.message.reply_text("Введите значение (для сброса таймера введите 1):")
-    return PROMO_VALUE
-
-async def promo_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        value = int(update.message.text)
-        if value <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Введите положительное число.")
-        return PROMO_VALUE
-    context.user_data["promo_value"] = value
-    await update.message.reply_text("Введите максимальное количество использований (например, 10):")
-    return PROMO_USES
-
-async def promo_uses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        uses = int(update.message.text)
-        if uses <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Введите положительное число.")
-        return PROMO_USES
-    context.user_data["promo_uses"] = uses
-    await update.message.reply_text("Введите срок действия в часах (0 - бессрочно):")
-    return PROMO_DURATION
-
-async def promo_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        duration = float(update.message.text)
-        if duration < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Введите число (0 для бессрочного).")
-        return PROMO_DURATION
-    code = context.user_data["promo_code"]
-    promo_type = context.user_data["promo_type"]
-    value = context.user_data["promo_value"]
-    uses = context.user_data["promo_uses"]
-    promos = load_data(PROMOCODES_FILE, {})
-    promos[code] = {
-        "type": promo_type,
-        "value": value,
-        "max_uses": uses,
-        "used": 0,
-        "expire": time.time() + duration * 3600 if duration > 0 else 0
-    }
-    save_data(PROMOCODES_FILE, promos)
-    await update.message.reply_text(f"✅ Промокод '{code}' создан!\nТип: {promo_type}\nЗначение: {value}\nИспользований: {uses}\nСрок: {'бессрочно' if duration == 0 else f'{duration} ч'}")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def cancel_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Создание промокода отменено.")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def redeem_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if is_banned(user.id):
-        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
-        return
-    if not await is_subscribed(user.id, context):
-        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
-        return
-    if not context.args:
-        await update.message.reply_text("ℹ️ Использование: /redeem <код>")
-        return
-    code = context.args[0].strip()
-    promos = load_data(PROMOCODES_FILE, {})
-    if code not in promos:
-        await update.message.reply_text("❌ Неверный промокод.")
-        return
-    promo = promos[code]
-    if promo["expire"] != 0 and promo["expire"] < time.time():
-        await update.message.reply_text("❌ Срок действия промокода истёк.")
-        return
-    if promo["used"] >= promo["max_uses"]:
-        await update.message.reply_text("❌ Промокод уже использован максимальное число раз.")
-        return
-    if promo["type"] == "coins":
-        new_balance = update_coins(user.id, promo["value"])
-        await update.message.reply_text(f"✅ Промокод активирован! Вы получили {promo['value']} монет.\n💰 Новый баланс: {new_balance}")
-    elif promo["type"] == "reset":
-        users = load_data(USERS_FILE, {})
-        user_data = users.get(str(user.id), {})
-        user_data["last_drop"] = 0
-        users[str(user.id)] = user_data
-        save_data(USERS_FILE, users)
-        await update.message.reply_text("✅ Промокод активирован! Таймер получения карточки сброшен.")
-    promos[code]["used"] += 1
-    save_data(PROMOCODES_FILE, promos)
-
-# ПРЕДЛОЖЕНИЕ КАРТОЧКИ
-async def suggest_card_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    if is_banned(user.id):
-        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
-        return ConversationHandler.END
-    if not await is_subscribed(user.id, context):
-        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
-        return ConversationHandler.END
-    await update.message.reply_text("Введите название предлагаемой карточки:")
-    return SUGGEST_NAME
-
-async def suggest_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["suggest_name"] = update.message.text.strip()
-    await update.message.reply_text("Введите описание карточки:")
-    return SUGGEST_DESCRIPTION
-
-async def suggest_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["suggest_desc"] = update.message.text.strip()
-    await update.message.reply_text("Отправьте изображение карточки (фото):")
-    return SUGGEST_IMAGE
-
-async def suggest_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.photo:
-        await update.message.reply_text("❌ Пожалуйста, отправьте изображение!")
-        return SUGGEST_IMAGE
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    os.makedirs(CARDS_IMAGE_DIR, exist_ok=True)
-    filename = f"suggest_{int(time.time())}.jpg"
-    image_path = os.path.join(CARDS_IMAGE_DIR, filename)
-    await file.download_to_drive(image_path)
-    suggestions = load_data(SUGGESTIONS_FILE, {})
-    suggest_id = str(int(time.time()))
-    suggestions[suggest_id] = {
-        "user_id": update.effective_user.id,
-        "name": context.user_data["suggest_name"],
-        "description": context.user_data["suggest_desc"],
-        "image": filename,
-        "status": "pending"
-    }
-    save_data(SUGGESTIONS_FILE, suggestions)
-    keyboard = [
-        [InlineKeyboardButton("✅ Принять", callback_data=f"accept_suggest_{suggest_id}")],
-        [InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_suggest_{suggest_id}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(
-        ADMIN_ID,
-        f"📩 Новое предложение карточки от пользователя @{update.effective_user.username or update.effective_user.id}\n\n"
-        f"Название: {context.user_data['suggest_name']}\n"
-        f"Описание: {context.user_data['suggest_desc']}\n"
-        f"Изображение: {filename}",
-        reply_markup=reply_markup
-    )
-    await update.message.reply_text("✅ Ваше предложение отправлено на рассмотрение администратору.")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def cancel_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Предложение карточки отменено.")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-# Обработка кнопок принятия/отклонения предложения
-async def suggest_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data.startswith("reject_suggest_"):
-        suggest_id = data[len("reject_suggest_"):]
-        suggestions = load_data(SUGGESTIONS_FILE, {})
-        if suggest_id in suggestions:
-            suggestions[suggest_id]["status"] = "rejected"
-            save_data(SUGGESTIONS_FILE, suggestions)
-            user_id = suggestions[suggest_id]["user_id"]
-            try:
-                await context.bot.send_message(user_id, "❌ Ваше предложение карточки было отклонено администратором.")
-            except:
-                pass
-            await query.edit_message_text("❌ Предложение отклонено.")
-        else:
-            await query.edit_message_text("❌ Предложение не найдено.")
-        return
-    elif data.startswith("accept_suggest_"):
-        suggest_id = data[len("accept_suggest_"):]
-        suggestions = load_data(SUGGESTIONS_FILE, {})
-        if suggest_id not in suggestions:
-            await query.edit_message_text("❌ Предложение не найдено.")
-            return
-        rarities = load_data(RARITIES_FILE, [])
-        if not rarities:
-            await query.edit_message_text("❌ Нет доступных редкостей. Сначала добавьте редкости.")
-            return
-        keyboard = []
-        for r in rarities:
-            keyboard.append([InlineKeyboardButton(f"{r['emoji']} {r['name']}", callback_data=f"choose_rarity_{suggest_id}_{r['name']}")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("Выберите редкость для новой карточки:", reply_markup=reply_markup)
-
-async def choose_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    parts = data.split("_", 3)
-    if len(parts) < 4:
-        await query.edit_message_text("❌ Ошибка.")
-        return
-    suggest_id = parts[2]
-    rarity_name = parts[3]
-    suggestions = load_data(SUGGESTIONS_FILE, {})
-    if suggest_id not in suggestions:
-        await query.edit_message_text("❌ Предложение не найдено.")
-        return
-    suggest = suggestions[suggest_id]
-    cards = load_data(CARDS_FILE, [])
-    new_id = max(card["id"] for card in cards) + 1 if cards else 1
-    new_card = {
-        "id": new_id,
-        "name": suggest["name"],
-        "rarity": rarity_name,
-        "image": suggest["image"],
-        "description": suggest["description"]
-    }
-    cards.append(new_card)
-    save_data(CARDS_FILE, cards)
-    suggestions[suggest_id]["status"] = "accepted"
-    save_data(SUGGESTIONS_FILE, suggestions)
-    update_coins(suggest["user_id"], 50)
-    try:
-        await context.bot.send_message(
-            suggest["user_id"],
-            f"✅ Ваша карточка '{suggest['name']}' была принята! Вы получили 50 монет."
-        )
-    except:
-        pass
-    await query.edit_message_text(f"✅ Карточка '{suggest['name']}' добавлена с редкостью {rarity_name}!")
-
-# БАФФЫ
+# ============================ БАФФЫ ============================
 async def buff_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if is_banned(user.id):
@@ -2265,7 +2001,607 @@ async def upgrade_buff_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Посмотреть эффекты: /buff"
         )
 
-# ================== MAIN ==================
+# ============================ ПРОМОКОДЫ ============================
+async def create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not has_admin_access(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
+        return ConversationHandler.END
+    await update.message.reply_text("Введите код промокода (латиница, без пробелов):")
+    return PROMO_NAME
+
+async def promo_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    code = update.message.text.strip()
+    if " " in code:
+        await update.message.reply_text("❌ Код не должен содержать пробелов. Введите снова:")
+        return PROMO_NAME
+    promos = load_data(PROMOCODES_FILE, {})
+    if code in promos:
+        await update.message.reply_text("❌ Такой промокод уже существует. Введите другой:")
+        return PROMO_NAME
+    context.user_data["promo_code"] = code
+    await update.message.reply_text("Выберите тип награды:\n1 - монеты\n2 - сброс таймера")
+    return PROMO_TYPE
+
+async def promo_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "1":
+        promo_type = "coins"
+    elif text == "2":
+        promo_type = "reset"
+    else:
+        await update.message.reply_text("❌ Введите 1 или 2.")
+        return PROMO_TYPE
+    context.user_data["promo_type"] = promo_type
+    if promo_type == "coins":
+        await update.message.reply_text("Введите количество монет для начисления:")
+    else:
+        await update.message.reply_text("Введите значение (для сброса таймера введите 1):")
+    return PROMO_VALUE
+
+async def promo_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        value = int(update.message.text)
+        if value <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите положительное число.")
+        return PROMO_VALUE
+    context.user_data["promo_value"] = value
+    await update.message.reply_text("Введите максимальное количество использований (например, 10):")
+    return PROMO_USES
+
+async def promo_uses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        uses = int(update.message.text)
+        if uses <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите положительное число.")
+        return PROMO_USES
+    context.user_data["promo_uses"] = uses
+    await update.message.reply_text("Введите срок действия в часах (0 - бессрочно):")
+    return PROMO_DURATION
+
+async def promo_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        duration = float(update.message.text)
+        if duration < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите число (0 для бессрочного).")
+        return PROMO_DURATION
+    code = context.user_data["promo_code"]
+    promo_type = context.user_data["promo_type"]
+    value = context.user_data["promo_value"]
+    uses = context.user_data["promo_uses"]
+    promos = load_data(PROMOCODES_FILE, {})
+    promos[code] = {
+        "type": promo_type,
+        "value": value,
+        "max_uses": uses,
+        "used": 0,
+        "expire": time.time() + duration * 3600 if duration > 0 else 0,
+        "users": []
+    }
+    save_data(PROMOCODES_FILE, promos)
+    await update.message.reply_text(f"✅ Промокод '{code}' создан!\nТип: {promo_type}\nЗначение: {value}\nИспользований: {uses}\nСрок: {'бессрочно' if duration == 0 else f'{duration} ч'}")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Создание промокода отменено.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def redeem_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /redeem <код>")
+        return
+    code = context.args[0].strip()
+    promos = load_data(PROMOCODES_FILE, {})
+    if code not in promos:
+        await update.message.reply_text("❌ Неверный промокод.")
+        return
+    promo = promos[code]
+    if promo["expire"] != 0 and promo["expire"] < time.time():
+        await update.message.reply_text("❌ Срок действия промокода истёк.")
+        return
+    if promo["used"] >= promo["max_uses"]:
+        await update.message.reply_text("❌ Промокод уже использован максимальное число раз.")
+        return
+    if str(user.id) in promo["users"]:
+        await update.message.reply_text("❌ Вы уже использовали этот промокод.")
+        return
+    if promo["type"] == "coins":
+        new_balance = update_coins(user.id, promo["value"])
+        await update.message.reply_text(f"✅ Промокод активирован! Вы получили {promo['value']} монет.\n💰 Новый баланс: {new_balance}")
+    elif promo["type"] == "reset":
+        users = load_data(USERS_FILE, {})
+        user_data = users.get(str(user.id), {})
+        user_data["last_drop"] = 0
+        users[str(user.id)] = user_data
+        save_data(USERS_FILE, users)
+        await update.message.reply_text("✅ Промокод активирован! Таймер получения карточки сброшен.")
+    promos[code]["used"] += 1
+    promos[code]["users"].append(str(user.id))
+    save_data(PROMOCODES_FILE, promos)
+
+# ============================ ПРЕДЛОЖЕНИЕ КАРТОЧКИ ============================
+async def suggest_card_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return ConversationHandler.END
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return ConversationHandler.END
+    await update.message.reply_text("Введите название предлагаемой карточки:")
+    return SUGGEST_NAME
+
+async def suggest_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["suggest_name"] = update.message.text.strip()
+    await update.message.reply_text("Введите описание карточки:")
+    return SUGGEST_DESCRIPTION
+
+async def suggest_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["suggest_desc"] = update.message.text.strip()
+    await update.message.reply_text("Отправьте изображение карточки (фото):")
+    return SUGGEST_IMAGE
+
+async def suggest_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message.photo:
+        await update.message.reply_text("❌ Пожалуйста, отправьте изображение!")
+        return SUGGEST_IMAGE
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    os.makedirs(CARDS_IMAGE_DIR, exist_ok=True)
+    filename = f"suggest_{int(time.time())}.jpg"
+    image_path = os.path.join(CARDS_IMAGE_DIR, filename)
+    await file.download_to_drive(image_path)
+    suggestions = load_data(SUGGESTIONS_FILE, {})
+    suggest_id = str(int(time.time()))
+    suggestions[suggest_id] = {
+        "user_id": update.effective_user.id,
+        "name": context.user_data["suggest_name"],
+        "description": context.user_data["suggest_desc"],
+        "image": filename,
+        "status": "pending"
+    }
+    save_data(SUGGESTIONS_FILE, suggestions)
+    keyboard = [
+        [InlineKeyboardButton("✅ Принять", callback_data=f"accept_suggest_{suggest_id}")],
+        [InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_suggest_{suggest_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    caption = (
+        f"📩 Новое предложение карточки от пользователя @{update.effective_user.username or update.effective_user.id}\n\n"
+        f"Название: {context.user_data['suggest_name']}\n"
+        f"Описание: {context.user_data['suggest_desc']}"
+    )
+    try:
+        with open(image_path, "rb") as img:
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=img,
+                caption=caption,
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.error(f"Ошибка отправки фото админу: {e}")
+        await update.message.reply_text("❌ Не удалось отправить изображение администратору.")
+        return ConversationHandler.END
+    await update.message.reply_text("✅ Ваше предложение отправлено на рассмотрение администратору.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Предложение карточки отменено.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def suggest_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("reject_suggest_"):
+        suggest_id = data[len("reject_suggest_"):]
+        suggestions = load_data(SUGGESTIONS_FILE, {})
+        if suggest_id in suggestions:
+            suggestions[suggest_id]["status"] = "rejected"
+            save_data(SUGGESTIONS_FILE, suggestions)
+            user_id = suggestions[suggest_id]["user_id"]
+            try:
+                await context.bot.send_message(user_id, "❌ Ваше предложение карточки было отклонено администратором.")
+            except:
+                pass
+            await query.edit_message_text("❌ Предложение отклонено.")
+        else:
+            await query.edit_message_text("❌ Предложение не найдено.")
+        return
+    elif data.startswith("accept_suggest_"):
+        suggest_id = data[len("accept_suggest_"):]
+        suggestions = load_data(SUGGESTIONS_FILE, {})
+        if suggest_id not in suggestions:
+            await query.edit_message_text("❌ Предложение не найдено.")
+            return
+        rarities = load_data(RARITIES_FILE, [])
+        if not rarities:
+            await query.edit_message_text("❌ Нет доступных редкостей. Сначала добавьте редкости.")
+            return
+        keyboard = []
+        for r in rarities:
+            keyboard.append([InlineKeyboardButton(f"{r['emoji']} {r['name']}", callback_data=f"choose_rarity_{suggest_id}_{r['name']}")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Выберите редкость для новой карточки:", reply_markup=reply_markup)
+
+async def choose_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    parts = data.split("_", 3)
+    if len(parts) < 4:
+        await query.edit_message_text("❌ Ошибка.")
+        return
+    suggest_id = parts[2]
+    rarity_name = parts[3]
+    suggestions = load_data(SUGGESTIONS_FILE, {})
+    if suggest_id not in suggestions:
+        await query.edit_message_text("❌ Предложение не найдено.")
+        return
+    suggest = suggestions[suggest_id]
+    cards = load_data(CARDS_FILE, [])
+    new_id = max(card["id"] for card in cards) + 1 if cards else 1
+    new_card = {
+        "id": new_id,
+        "name": suggest["name"],
+        "rarity": rarity_name,
+        "image": suggest["image"],
+        "description": suggest["description"]
+    }
+    cards.append(new_card)
+    save_data(CARDS_FILE, cards)
+    suggestions[suggest_id]["status"] = "accepted"
+    save_data(SUGGESTIONS_FILE, suggestions)
+    update_coins(suggest["user_id"], 50)
+    try:
+        await context.bot.send_message(
+            suggest["user_id"],
+            f"✅ Ваша карточка '{suggest['name']}' была принята! Вы получили 50 монет."
+        )
+    except:
+        pass
+    await query.edit_message_text(f"✅ Карточка '{suggest['name']}' добавлена с редкостью {rarity_name}!")
+
+# ============================ ПРОФИЛЬ ============================
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user.id), {})
+    cards = load_data(CARDS_FILE, [])
+    total_cards = len(cards)
+    user_cards = user_data.get("cards", [])
+    seen_cards = user_data.get("seen_cards", [])
+    unique_seen = len(seen_cards)
+    balance = get_coins(user.id)
+    buff = get_active_buff(user.id)
+    message = f"👤 <b>Профиль игрока</b>\n\n"
+    message += f"💰 Баланс: {balance} монет\n"
+    message += f"🃏 Всего карточек в коллекции: {len(user_cards)}\n"
+    message += f"📊 Карточек открыто: {unique_seen} из {total_cards} ({unique_seen/total_cards*100:.1f}%)\n"
+    if buff:
+        card_id = buff["card_id"]
+        level = buff["level"]
+        card = next((c for c in cards if c["id"] == card_id), None)
+        card_name = card["name"] if card else f"ID {card_id}"
+        message += f"⚡ Активный бафф: {card_name} (уровень {level})\n"
+    else:
+        message += "⚡ Активный бафф: нет\n"
+    message += f"📈 Прогресс коллекции: {unique_seen}/{total_cards}"
+    await update.message.reply_text(message, parse_mode="HTML")
+
+# ============================ СТАВКИ (БУКМЕКЕРСКАЯ СИСТЕМА) ============================
+def generate_outcomes():
+    """Возвращает список стандартных исходов для матча с типами и коэффициентами"""
+    outcomes = [
+        {"label": "П1", "type": "p1", "coefficient": 2.0},
+        {"label": "П2", "type": "p2", "coefficient": 2.0},
+        {"label": "ТБ 2.5", "type": "tb", "threshold": 2.5, "coefficient": 1.8},
+        {"label": "ТМ 2.5", "type": "tm", "threshold": 2.5, "coefficient": 1.9},
+        {"label": "ТБ 3.5", "type": "tb", "threshold": 3.5, "coefficient": 2.2},
+        {"label": "ТМ 3.5", "type": "tm", "threshold": 3.5, "coefficient": 1.7},
+        {"label": "ТБ 4.5", "type": "tb", "threshold": 4.5, "coefficient": 2.6},
+        {"label": "ТМ 4.5", "type": "tm", "threshold": 4.5, "coefficient": 1.5},
+    ]
+    # Добавим ID для каждого исхода при сохранении
+    return outcomes
+
+async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
+        return
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("ℹ️ Использование: /create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ>")
+        return
+    team1 = args[0]
+    team2 = args[1]
+    time_str = " ".join(args[2:])
+    try:
+        deadline = datetime.strptime(time_str, "%d.%m.%Y %H:%M")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат времени. Используйте ДД.ММ.ГГГГ ЧЧ:ММ")
+        return
+    events = load_data(EVENTS_FILE, [])
+    new_id = max([e["id"] for e in events], default=0) + 1
+    # Генерируем исходы
+    outcomes = generate_outcomes()
+    # Присваиваем ID каждому исходу
+    for i, o in enumerate(outcomes):
+        o["id"] = i + 1
+    events.append({
+        "id": new_id,
+        "team1": team1,
+        "team2": team2,
+        "deadline": deadline.timestamp(),
+        "status": "active",
+        "outcomes": outcomes,
+        "winning_outcome_id": None,
+        "score": None
+    })
+    save_data(EVENTS_FILE, events)
+    await update.message.reply_text(f"✅ Матч {team1} - {team2} создан (ID: {new_id}).\n"
+                                    f"Приём ставок до {deadline.strftime('%d.%m.%Y %H:%M')}.\n"
+                                    "Исходы созданы автоматически.")
+
+async def finish_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("ℹ️ Использование: /finish_match <match_id> <счёт> (например 3:1)")
+        return
+    try:
+        match_id = int(args[0])
+        score = args[1]
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат ID.")
+        return
+    try:
+        parts = score.split(":")
+        if len(parts) != 2:
+            raise ValueError
+        g1 = int(parts[0])
+        g2 = int(parts[1])
+    except:
+        await update.message.reply_text("❌ Неверный формат счёта. Используйте X:Y (например 3:1)")
+        return
+    events = load_data(EVENTS_FILE, [])
+    event = next((e for e in events if e["id"] == match_id), None)
+    if not event:
+        await update.message.reply_text("❌ Матч не найден.")
+        return
+    if event["status"] != "active":
+        await update.message.reply_text("❌ Матч уже завершён.")
+        return
+    if not event.get("outcomes"):
+        await update.message.reply_text("❌ У этого матча нет исходов. Матч создан старой версией бота, удалите events.json и создайте новый матч.")
+        return
+
+    # Обновляем статус матча
+    event["status"] = "finished"
+    event["score"] = score
+    save_data(EVENTS_FILE, events)
+
+    # Обрабатываем ставки
+    bets = load_data(BETS_FILE, [])
+    total_wins = 0
+    total_loses = 0
+    for bet in bets:
+        if bet["match_id"] == match_id and bet["status"] == "pending":
+            # Находим исход
+            outcome = next((o for o in event["outcomes"] if o["id"] == bet["outcome_id"]), None)
+            if not outcome:
+                continue
+            # Проверяем условие исхода
+            o_type = outcome.get("type")
+            win = False
+            if o_type == "p1":
+                win = g1 > g2
+            elif o_type == "p2":
+                win = g2 > g1
+            elif o_type == "draw":
+                win = g1 == g2
+            elif o_type == "tb":
+                threshold = outcome.get("threshold", 0)
+                win = (g1 + g2) > threshold
+            elif o_type == "tm":
+                threshold = outcome.get("threshold", 0)
+                win = (g1 + g2) < threshold
+            else:
+                continue  # неизвестный тип
+
+            if win:
+                bet["status"] = "win"
+                win_amount = int(bet["amount"] * outcome["coefficient"])
+                update_coins(bet["user_id"], win_amount)
+                total_wins += 1
+                try:
+                    await context.bot.send_message(
+                        bet["user_id"],
+                        f"🎉 Ваша ставка на матч {event['team1']} - {event['team2']} выиграла!\n"
+                        f"Исход: {outcome['label']}\nСумма выигрыша: {win_amount} монет."
+                    )
+                except:
+                    pass
+            else:
+                bet["status"] = "lose"
+                total_loses += 1
+                try:
+                    await context.bot.send_message(
+                        bet["user_id"],
+                        f"❌ Ваша ставка на матч {event['team1']} - {event['team2']} проиграла.\nИсход: {outcome['label']}"
+                    )
+                except:
+                    pass
+    save_data(BETS_FILE, bets)
+
+    await update.message.reply_text(f"✅ Матч '{event['team1']} - {event['team2']}' завершён со счётом {score}.\n"
+                                    f"Обработано ставок: выигрышных - {total_wins}, проигрышных - {total_loses}.")
+
+# Инлайн-меню для ставок
+async def bet_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    events = load_data(EVENTS_FILE, [])
+    active_events = [e for e in events if e["status"] == "active" and time.time() < e["deadline"]]
+    if not active_events:
+        await update.message.reply_text("📭 Активных матчей для ставок нет.")
+        return
+    keyboard = []
+    for e in active_events:
+        keyboard.append([InlineKeyboardButton(f"{e['team1']} - {e['team2']}", callback_data=f"bet_match_{e['id']}")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Выберите матч для ставки:", reply_markup=reply_markup)
+
+async def bet_match_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    match_id = int(data.split("_")[2])
+    context.user_data["bet_match_id"] = match_id
+    events = load_data(EVENTS_FILE, [])
+    event = next((e for e in events if e["id"] == match_id), None)
+    if not event:
+        await query.edit_message_text("❌ Матч не найден.")
+        return
+    if not event["outcomes"]:
+        await query.edit_message_text("❌ Для этого матча нет исходов.")
+        return
+    keyboard = []
+    for o in event["outcomes"]:
+        keyboard.append([InlineKeyboardButton(f"{o['label']} (коэф {o['coefficient']})", callback_data=f"bet_outcome_{match_id}_{o['id']}")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(f"Выберите исход для матча {event['team1']} - {event['team2']}:", reply_markup=reply_markup)
+
+async def bet_outcome_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    parts = data.split("_")
+    match_id = int(parts[2])
+    outcome_id = int(parts[3])
+    context.user_data["bet_outcome_id"] = outcome_id
+    context.user_data["bet_match_id"] = match_id
+    await query.edit_message_text("Введите сумму ставки (в монетах):")
+    context.user_data["bet_state"] = "awaiting_amount"
+
+async def bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("bet_state") != "awaiting_amount":
+        return
+    user = update.effective_user
+    try:
+        amount = int(update.message.text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите положительное число.")
+        return
+    match_id = context.user_data["bet_match_id"]
+    outcome_id = context.user_data["bet_outcome_id"]
+    events = load_data(EVENTS_FILE, [])
+    event = next((e for e in events if e["id"] == match_id), None)
+    if not event:
+        await update.message.reply_text("❌ Матч не найден.")
+        return
+    if event["status"] != "active" or time.time() > event["deadline"]:
+        await update.message.reply_text("❌ Время приёма ставок истекло или матч завершён.")
+        return
+    outcome = next((o for o in event["outcomes"] if o["id"] == outcome_id), None)
+    if not outcome:
+        await update.message.reply_text("❌ Исход не найден.")
+        return
+    # Проверяем, есть ли уже ставка на этот матч у пользователя
+    bets = load_data(BETS_FILE, [])
+    existing_bet = next((b for b in bets if b["user_id"] == user.id and b["match_id"] == match_id and b["status"] == "pending"), None)
+    if existing_bet:
+        await update.message.reply_text("❌ Вы уже сделали ставку на этот матч. Повторная ставка запрещена.")
+        return
+    balance = get_coins(user.id)
+    if balance < amount:
+        await update.message.reply_text("❌ Недостаточно монет.")
+        return
+    # Сохраняем ставку
+    bets.append({
+        "user_id": user.id,
+        "match_id": match_id,
+        "outcome_id": outcome_id,
+        "amount": amount,
+        "status": "pending"
+    })
+    save_data(BETS_FILE, bets)
+    # Обновляем сумму ставок в исходе
+    outcome["total_bet"] = outcome.get("total_bet", 0) + amount
+    save_data(EVENTS_FILE, events)
+    update_coins(user.id, -amount)
+    await update.message.reply_text(
+        f"✅ Ставка принята!\n"
+        f"Матч: {event['team1']} - {event['team2']}\n"
+        f"Исход: {outcome['label']} (коэф {outcome['coefficient']})\n"
+        f"Сумма: {amount} монет"
+    )
+    context.user_data.pop("bet_state", None)
+    context.user_data.pop("bet_match_id", None)
+    context.user_data.pop("bet_outcome_id", None)
+
+async def my_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    bets = load_data(BETS_FILE, [])
+    user_bets = [b for b in bets if b["user_id"] == user.id]
+    if not user_bets:
+        await update.message.reply_text("📭 У вас нет ставок.")
+        return
+    events = load_data(EVENTS_FILE, [])
+    message = "📋 <b>Мои ставки:</b>\n\n"
+    for b in user_bets:
+        event = next((e for e in events if e["id"] == b["match_id"]), None)
+        event_name = f"{event['team1']} - {event['team2']}" if event else f"Матч {b['match_id']}"
+        outcome_label = "неизвестно"
+        if event:
+            outcome = next((o for o in event["outcomes"] if o["id"] == b["outcome_id"]), None)
+            if outcome:
+                outcome_label = outcome["label"]
+        status_emoji = {"pending": "⏳", "win": "✅", "lose": "❌"}
+        status_text = {"pending": "Ожидает", "win": "Выигрыш", "lose": "Проигрыш"}
+        message += f"🆔 {b.get('id', '?')}: {event_name} -> {outcome_label}\n"
+        message += f"   Сумма: {b['amount']} монет, Статус: {status_emoji.get(b['status'], '❓')} {status_text.get(b['status'], 'Неизвестно')}\n\n"
+    await update.message.reply_text(message, parse_mode="HTML")
+
+# ============================ MAIN ============================
 def main() -> None:
     os.makedirs(CARDS_IMAGE_DIR, exist_ok=True)
     # Инициализация файлов
@@ -2276,9 +2612,9 @@ def main() -> None:
             {"id": 3, "name": "Казума", "rarity": "Эпическая", "image": "kazuma.png", "description": "Алкаш"},
             {"id": 4, "name": "Китаец", "rarity": "Обычная", "image": "kitaec.png", "description": "Узкоглазый"}
         ])
-    for f in [USERS_FILE, TRADES_FILE, BLACKLIST_FILE, MODERATORS_FILE, COINS_FILE, RARITIES_FILE, SHOP_FILE, PROMOCODES_FILE, SUGGESTIONS_FILE]:
+    for f in [USERS_FILE, TRADES_FILE, BLACKLIST_FILE, MODERATORS_FILE, COINS_FILE, RARITIES_FILE, SHOP_FILE, PROMOCODES_FILE, SUGGESTIONS_FILE, EVENTS_FILE, BETS_FILE]:
         if not os.path.exists(f):
-            if f in [BLACKLIST_FILE, MODERATORS_FILE, SHOP_FILE]:
+            if f in [BLACKLIST_FILE, MODERATORS_FILE, SHOP_FILE, EVENTS_FILE, BETS_FILE]:
                 save_data(f, [])
             else:
                 save_data(f, {})
@@ -2394,13 +2730,17 @@ def main() -> None:
     application.add_handler(CommandHandler("admin_removecoins", admin_removecoins))
     application.add_handler(CommandHandler("admin_listrarities", admin_listrarities))
     application.add_handler(CommandHandler("admin_listshop", admin_listshop))
-    # Новые команды
     application.add_handler(CommandHandler("casino", casino))
     application.add_handler(CommandHandler("coin", coin_flip))
     application.add_handler(CommandHandler("buff", buff_info))
     application.add_handler(CommandHandler("set_buff", set_buff))
     application.add_handler(CommandHandler("upgrade_buff", upgrade_buff))
     application.add_handler(CommandHandler("redeem", redeem_promo))
+    application.add_handler(CommandHandler("profile", profile))
+    application.add_handler(CommandHandler("create_match", create_match))
+    application.add_handler(CommandHandler("finish_match", finish_match))
+    application.add_handler(CommandHandler("bet", bet_start))
+    application.add_handler(CommandHandler("my_bets", my_bets))
 
     # CallbackQueryHandler'ы
     application.add_handler(CallbackQueryHandler(trade_button, pattern=r"^(confirm_trade_|accept_trade_|reject_trade_|cancel_trade)"))
@@ -2409,8 +2749,13 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(upgrade_buff_buttons, pattern=r"^(confirm_upgrade_buff|cancel_upgrade_buff)"))
     application.add_handler(CallbackQueryHandler(suggest_buttons, pattern=r"^(accept_suggest_|reject_suggest_)"))
     application.add_handler(CallbackQueryHandler(choose_rarity, pattern=r"^choose_rarity_"))
+    application.add_handler(CallbackQueryHandler(bet_match_callback, pattern=r"^bet_match_"))
+    application.add_handler(CallbackQueryHandler(bet_outcome_callback, pattern=r"^bet_outcome_"))
 
-    # MessageHandler для обмена и подписки
+    # MessageHandler для ввода суммы ставки
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bet_amount))
+
+    # Обмен и подписка
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_trade))
     application.add_handler(MessageHandler(filters.ALL, check_subscription))
 
