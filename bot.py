@@ -847,6 +847,10 @@ async def trade_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not trade or trade["status"] != "pending":
             await query.edit_message_text("❌ Предложение об обмене не найдено или устарело!")
             return
+        # Проверяем, что текущий пользователь - получатель обмена
+        if trade["to_user"] != user_id:
+            await query.edit_message_text("❌ Вы не являетесь получателем этого обмена!")
+            return
         if action == "reject":
             trades[trade_id]["status"] = "rejected"
             save_data(TRADES_FILE, trades)
@@ -863,6 +867,7 @@ async def trade_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         users = load_data(USERS_FILE, {})
         from_user_data = users.get(str(trade["from_user"]), {})
         to_user_data = users.get(str(trade["to_user"]), {})
+        # Проверяем наличие карточек
         if (trade["from_card"] not in from_user_data.get("cards", []) or 
             trade["to_card"] not in to_user_data.get("cards", [])):
             await query.edit_message_text("❌ Обмен невозможен: карточки больше недоступны!")
@@ -2232,9 +2237,19 @@ async def suggest_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text("❌ Предложение не найдено.")
             return
         rarities = load_data(RARITIES_FILE, [])
+        # Если редкостей нет, создаём дефолтные (как при инициализации)
         if not rarities:
-            await query.edit_message_text("❌ Нет доступных редкостей. Сначала добавьте редкости.")
-            return
+            logger.warning("Редкости не загружены, создаю дефолтные.")
+            default_rarities = [
+                {"name": "Легендарная", "emoji": "🔥", "droppable": True},
+                {"name": "Блещет умом", "emoji": "🧠", "droppable": True},
+                {"name": "Эпическая", "emoji": "💎", "droppable": True},
+                {"name": "Редкая", "emoji": "✨", "droppable": True},
+                {"name": "Обычная", "emoji": "🃏", "droppable": True},
+                {"name": "Эксклюзивная", "emoji": "😎", "droppable": False}
+            ]
+            save_data(RARITIES_FILE, default_rarities)
+            rarities = default_rarities
         keyboard = []
         for r in rarities:
             keyboard.append([InlineKeyboardButton(f"{r['emoji']} {r['name']}", callback_data=f"choose_rarity_{suggest_id}_{r['name']}")])
@@ -2325,7 +2340,6 @@ def generate_outcomes():
         {"label": "ТБ 4.5", "type": "tb", "threshold": 4.5, "coefficient": 2.6},
         {"label": "ТМ 4.5", "type": "tm", "threshold": 4.5, "coefficient": 1.5},
     ]
-    # Добавим ID для каждого исхода при сохранении
     return outcomes
 
 async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2346,9 +2360,7 @@ async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     events = load_data(EVENTS_FILE, [])
     new_id = max([e["id"] for e in events], default=0) + 1
-    # Генерируем исходы
     outcomes = generate_outcomes()
-    # Присваиваем ID каждому исходу
     for i, o in enumerate(outcomes):
         o["id"] = i + 1
     events.append({
@@ -2401,22 +2413,18 @@ async def finish_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("❌ У этого матча нет исходов. Матч создан старой версией бота, удалите events.json и создайте новый матч.")
         return
 
-    # Обновляем статус матча
     event["status"] = "finished"
     event["score"] = score
     save_data(EVENTS_FILE, events)
 
-    # Обрабатываем ставки
     bets = load_data(BETS_FILE, [])
     total_wins = 0
     total_loses = 0
     for bet in bets:
         if bet["match_id"] == match_id and bet["status"] == "pending":
-            # Находим исход
             outcome = next((o for o in event["outcomes"] if o["id"] == bet["outcome_id"]), None)
             if not outcome:
                 continue
-            # Проверяем условие исхода
             o_type = outcome.get("type")
             win = False
             if o_type == "p1":
@@ -2432,7 +2440,7 @@ async def finish_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 threshold = outcome.get("threshold", 0)
                 win = (g1 + g2) < threshold
             else:
-                continue  # неизвестный тип
+                continue
 
             if win:
                 bet["status"] = "win"
@@ -2539,7 +2547,6 @@ async def bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not outcome:
         await update.message.reply_text("❌ Исход не найден.")
         return
-    # Проверяем, есть ли уже ставка на этот матч у пользователя
     bets = load_data(BETS_FILE, [])
     existing_bet = next((b for b in bets if b["user_id"] == user.id and b["match_id"] == match_id and b["status"] == "pending"), None)
     if existing_bet:
@@ -2549,7 +2556,6 @@ async def bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if balance < amount:
         await update.message.reply_text("❌ Недостаточно монет.")
         return
-    # Сохраняем ставку
     bets.append({
         "user_id": user.id,
         "match_id": match_id,
@@ -2558,7 +2564,6 @@ async def bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "status": "pending"
     })
     save_data(BETS_FILE, bets)
-    # Обновляем сумму ставок в исходе
     outcome["total_bet"] = outcome.get("total_bet", 0) + amount
     save_data(EVENTS_FILE, events)
     update_coins(user.id, -amount)
