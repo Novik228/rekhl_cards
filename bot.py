@@ -3,6 +3,7 @@ import os
 import random
 import time
 import html
+import asyncio
 from datetime import datetime, timedelta
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,6 +22,11 @@ TOKEN = input("Введите токен бота: ")
 CHANNEL_ID = "-1002899939309"
 CHANNEL_LINK = "https://t.me/cabakoff"
 ADMIN_ID = 1106828306
+
+# ============================ ЕЖЕДНЕВНАЯ НАГРАДА ============================
+DAILY_COINS_AMOUNT = 50
+DAILY_CARD_CHANCE = 0.25  # 25% шанс получить случайную карточку вместе с монетами
+DAILY_COOLDOWN_SECONDS = 24 * 60 * 60
 
 # ============================ ПУТИ К ФАЙЛАМ ============================
 CARDS_FILE = "cards.json"
@@ -44,6 +50,9 @@ CRAFT_SELECT_CARDS = range(1)
 
 # Промокоды
 PROMO_NAME, PROMO_TYPE, PROMO_VALUE, PROMO_USES, PROMO_DURATION = range(5)
+
+# Рейтинговый режим
+RATING_TEAM_GK, RATING_TEAM_FIELD = range(2)
 
 # ============================ ЛОГГИРОВАНИЕ ============================
 logging.basicConfig(
@@ -225,6 +234,44 @@ def get_coin_bonus_multiplier(user_id: int) -> float:
 def is_legendary_or_higher(rarity: str) -> bool:
     return rarity in ["Легендарная", "Блещет умом", "Эксклюзивная"]
 
+# ============================ РЕЙТИНГОВЫЙ РЕЖИМ: СИЛА КАРТОЧЕК ============================
+RARITY_POWER = {
+    "Эксклюзивная": 110,
+    "Легендарная": 100,
+    "Блещет умом": 90,
+    "Эпическая": 70,
+    "Редкая": 50,
+    "Обычная": 30
+}
+DEFAULT_CARD_POWER = 40
+
+def get_card_power(card: dict) -> int:
+    return RARITY_POWER.get(card.get("rarity"), DEFAULT_CARD_POWER)
+
+def get_rating_elo(user_id: int) -> int:
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    return user_data.get("rating_elo", 1000)
+
+def set_rating_elo(user_id: int, elo: int):
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    user_data["rating_elo"] = elo
+    users[str(user_id)] = user_data
+    save_data(USERS_FILE, users)
+
+def get_rating_team(user_id: int):
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    return user_data.get("rating_team")
+
+def set_rating_team(user_id: int, gk_id: int, field_ids: list):
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    user_data["rating_team"] = {"gk": gk_id, "field": field_ids}
+    users[str(user_id)] = user_data
+    save_data(USERS_FILE, users)
+
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОФИЛЯ ========================
 def add_seen_card(user_id: int, card_id: int):
     users = load_data(USERS_FILE, {})
@@ -237,6 +284,69 @@ def add_seen_card(user_id: int, card_id: int):
         save_data(USERS_FILE, users)
 
 # ============================ ОСНОВНЫЕ КОМАНДЫ ============================
+
+USER_COMMANDS_TEXT = (
+    "📋 Основные команды:\n"
+    "/get_card - получить карточку\n"
+    "/my_cards - моя коллекция\n"
+    "/shop - магазин\n"
+    "/givecard <user_id> <card_id> - передать карточку\n"
+    "/balance - баланс монет\n"
+    "/card_info <card_id> - информация о карточке\n"
+    "/craft - улучшить карточки\n"
+    "/leaderboard - таблица лидеров\n"
+    "/casino <сумма> - сыграть в казино\n"
+    "/coin <орел|решка> <сумма> - подбросить монетку\n"
+    "/buff - информация о баффе\n"
+    "/set_buff <card_id> - выбрать карту для баффа\n"
+    "/upgrade_buff - улучшить бафф\n"
+    "/redeem <код> - активировать промокод\n"
+    "/profile - ваш профиль\n"
+    "/bet - сделать ставку (инлайн-меню)\n"
+    "/my_bets - мои ставки\n"
+    "/daily - забрать ежедневную награду\n"
+    "/rating_team - собрать состав для рейтингового режима\n"
+    "/find_match - найти соперника (рейтинговый режим)\n"
+    "/rating - мой рейтинг и текущий состав\n\n"
+    "⏳ Карточку можно получать каждые 6 часов!"
+)
+
+ADMIN_ONLY_COMMANDS_TEXT = (
+    "/admin_addcard - добавить карточку\n"
+    "/admin_listcards - список всех карточек\n"
+    "/admin_deletecard <card_id> - удалить карточку\n"
+    "/admin_resettimer <user_id> - сбросить таймер\n"
+    "/admin_givecard <user_id> <card_id> - выдать карточку\n"
+    "/admin_broadcast <message> - сделать рассылку\n"
+    "/ban <user_id> - заблокировать пользователя\n"
+    "/unban <user_id> - разблокировать пользователя\n"
+    "/add_moderator <user_id> - добавить модератора\n"
+    "/remove_moderator <user_id> - удалить модератора\n"
+    "/admin_givecoins <user_id> <amount> - выдать монеты\n"
+    "/admin_removecoins <user_id> <amount> - забрать монеты\n"
+    "/admin_addrarity - добавить редкость\n"
+    "/admin_listrarities - список редкостей\n"
+    "/admin_addshopitem - добавить товар в магазин\n"
+    "/admin_listshop - список товаров\n"
+    "/admin_editcard <card_id> - изменить карточку\n"
+    "/create_promo - создать промокод\n"
+    "/create_match <команда1> <команда2> <часы> - создать матч (приём ставок N часов)\n"
+    "/finish_match <match_id> <счёт> - завершить матч (например 3:1)"
+)
+
+MODERATOR_ONLY_COMMANDS_TEXT = (
+    "/admin_addcard - добавить карточку\n"
+    "/admin_listcards - список всех карточек\n"
+    "/admin_deletecard <card_id> - удалить карточку\n"
+    "/admin_addrarity - добавить редкость\n"
+    "/admin_listrarities - список редкостей\n"
+    "/admin_addshopitem - добавить товар в магазин\n"
+    "/admin_listshop - список товаров\n"
+    "/admin_editcard <card_id> - изменить карточку\n"
+    "/create_promo - создать промокод\n"
+    "/create_match <команда1> <команда2> <часы> - создать матч (приём ставок N часов)\n"
+    "/finish_match <match_id> <счёт> - завершить матч"
+)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -252,7 +362,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     users = load_data(USERS_FILE, {})
-    if str(user.id) not in users:
+    is_new_user = str(user.id) not in users
+    if is_new_user:
         users[str(user.id)] = {
             "cards": [],
             "last_drop": 0,
@@ -266,71 +377,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if str(user.id) not in coins_data:
             coins_data[str(user.id)] = 0
             save_data(COINS_FILE, coins_data)
-        if is_admin(user.id):
-            await update.message.reply_text(
-                "👑 Вы администратор. Доступные команды:\n"
-                "/admin_addcard - добавить карточку\n"
-                "/admin_listcards - список всех карточек\n"
-                "/admin_deletecard <card_id> - удалить карточку\n"
-                "/admin_resettimer <user_id> - сбросить таймер\n"
-                "/admin_givecard <user_id> <card_id> - выдать карточку\n"
-                "/admin_broadcast <message> - сделать рассылку\n"
-                "/ban <user_id> - заблокировать пользователя\n"
-                "/unban <user_id> - разблокировать пользователя\n"
-                "/add_moderator <user_id> - добавить модератора\n"
-                "/remove_moderator <user_id> - удалить модератора\n"
-                "/admin_givecoins <user_id> <amount> - выдать монеты\n"
-                "/admin_removecoins <user_id> <amount> - забрать монеты\n"
-                "/admin_addrarity - добавить редкость\n"
-                "/admin_listrarities - список редкостей\n"
-                "/admin_addshopitem - добавить товар в магазин\n"
-                "/admin_listshop - список товаров\n"
-                "/admin_editcard <card_id> - изменить карточку\n"
-                "/create_promo - создать промокод\n"
-                "/create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ> - создать матч\n"
-                "/finish_match <match_id> <счёт> - завершить матч (например 3:1)"
-            )
-        elif is_moderator(user.id):
-            await update.message.reply_text(
-                "🛡 Вы модератор. Доступные команды:\n"
-                "/admin_addcard - добавить карточку\n"
-                "/admin_listcards - список всех карточек\n"
-                "/admin_deletecard <card_id> - удалить карточку\n"
-                "/admin_addrarity - добавить редкость\n"
-                "/admin_listrarities - список редкостей\n"
-                "/admin_addshopitem - добавить товар в магазин\n"
-                "/admin_listshop - список товаров\n"
-                "/admin_editcard <card_id> - изменить карточку\n"
-                "/create_promo - создать промокод\n"
-                "/create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ> - создать матч\n"
-                "/finish_match <match_id> <счёт> - завершить матч"
-            )
-        else:
+        if not is_admin(user.id) and not is_moderator(user.id):
             await context.bot.send_message(
                 ADMIN_ID,
                 f"Новый пользователь: @{user.username} | ID: {user.id}"
-            )
-            await update.message.reply_text(
-                "🎮 Добро пожаловать в REKHL CARDS!\n\n"
-                "📋 Основные команды:\n"
-                "/get_card - получить карточку\n"
-                "/my_cards - моя коллекция\n"
-                "/shop - магазин\n"
-                "/givecard <user_id> <card_id> - передать карточку\n"
-                "/balance - баланс монет\n"
-                "/card_info <card_id> - информация о карточке\n"
-                "/craft - улучшить карточки\n"
-                "/leaderboard - таблица лидеров\n"
-                "/casino <сумма> - сыграть в казино\n"
-                "/coin <орел|решка> <сумма> - подбросить монетку\n"
-                "/buff - информация о баффе\n"
-                "/set_buff <card_id> - выбрать карту для баффа\n"
-                "/upgrade_buff - улучшить бафф\n"
-                "/redeem <код> - активировать промокод\n"
-                "/profile - ваш профиль\n"
-                "/bet - сделать ставку (инлайн-меню)\n"
-                "/my_bets - мои ставки\n\n"
-                "⏳ Карточку можно получать каждые 6 часов!"
             )
     else:
         user_data = users.get(str(user.id), {})
@@ -342,68 +392,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_data["seen_cards"] = []
         users[str(user.id)] = user_data
         save_data(USERS_FILE, users)
-        if is_admin(user.id):
-            await update.message.reply_text(
-                "👑 Вы администратор. Доступные команды:\n"
-                "/admin_addcard - добавить карточку\n"
-                "/admin_listcards - список всех карточек\n"
-                "/admin_deletecard <card_id> - удалить карточку\n"
-                "/admin_resettimer <user_id> - сбросить таймер\n"
-                "/admin_givecard <user_id> <card_id> - выдать карточку\n"
-                "/admin_broadcast <message> - сделать рассылку\n"
-                "/ban <user_id> - заблокировать пользователя\n"
-                "/unban <user_id> - разблокировать пользователя\n"
-                "/add_moderator <user_id> - добавить модератора\n"
-                "/remove_moderator <user_id> - удалить модератора\n"
-                "/admin_givecoins <user_id> <amount> - выдать монеты\n"
-                "/admin_removecoins <user_id> <amount> - забрать монеты\n"
-                "/admin_addrarity - добавить редкость\n"
-                "/admin_listrarities - список редкостей\n"
-                "/admin_addshopitem - добавить товар в магазин\n"
-                "/admin_listshop - список товаров\n"
-                "/admin_editcard <card_id> - изменить карточку\n"
-                "/create_promo - создать промокод\n"
-                "/create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ> - создать матч\n"
-                "/finish_match <match_id> <счёт> - завершить матч"
-            )
-        elif is_moderator(user.id):
-            await update.message.reply_text(
-                "🛡 Вы модератор. Доступные команды:\n"
-                "/admin_addcard - добавить карточку\n"
-                "/admin_listcards - список всех карточек\n"
-                "/admin_deletecard <card_id> - удалить карточку\n"
-                "/admin_addrarity - добавить редкость\n"
-                "/admin_listrarities - список редкостей\n"
-                "/admin_addshopitem - добавить товар в магазин\n"
-                "/admin_listshop - список товаров\n"
-                "/admin_editcard <card_id> - изменить карточку\n"
-                "/create_promo - создать промокод\n"
-                "/create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ> - создать матч\n"
-                "/finish_match <match_id> <счёт> - завершить матч"
-            )
-        else:
-            await update.message.reply_text(
-                "🎮 Добро пожаловать в REKHL CARDS!\n\n"
-                "📋 Основные команды:\n"
-                "/get_card - получить карточку\n"
-                "/my_cards - моя коллекция\n"
-                "/shop - магазин\n"
-                "/givecard <user_id> <card_id> - передать карточку\n"
-                "/balance - баланс монет\n"
-                "/card_info <card_id> - информация о карточке\n"
-                "/craft - улучшить карточки\n"
-                "/leaderboard - таблица лидеров\n"
-                "/casino <сумма> - сыграть в казино\n"
-                "/coin <орел|решка> <сумма> - подбросить монетку\n"
-                "/buff - информация о баффе\n"
-                "/set_buff <card_id> - выбрать карту для баффа\n"
-                "/upgrade_buff - улучшить бафф\n"
-                "/redeem <код> - активировать промокод\n"
-                "/profile - ваш профиль\n"
-                "/bet - сделать ставку (инлайн-меню)\n"
-                "/my_bets - мои ставки\n\n"
-                "⏳ Карточку можно получать каждые 6 часов!"
-            )
+
+    # Все пользователи (включая админов/модераторов) видят обычные команды.
+    # Админы и модераторы дополнительно видят свой набор команд.
+    # ВАЖНО: тексты команд содержат плейсхолдеры вида "card_id", "user_id" в угловых скобках.
+    # При parse_mode="HTML" Telegram пытается разобрать их как теги и падает,
+    # поэтому текст экранируем через html.escape(), а настоящие теги <b> добавляем уже поверх.
+    if is_admin(user.id):
+        await update.message.reply_text(
+            "👑 Вы администратор.\n\n"
+            "🛠 <b>Админские команды:</b>\n" + html.escape(ADMIN_ONLY_COMMANDS_TEXT) + "\n\n"
+            "👤 <b>Обычные команды:</b>\n" + html.escape(USER_COMMANDS_TEXT),
+            parse_mode="HTML"
+        )
+    elif is_moderator(user.id):
+        await update.message.reply_text(
+            "🛡 Вы модератор.\n\n"
+            "🛠 <b>Модераторские команды:</b>\n" + html.escape(MODERATOR_ONLY_COMMANDS_TEXT) + "\n\n"
+            "👤 <b>Обычные команды:</b>\n" + html.escape(USER_COMMANDS_TEXT),
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            "🎮 Добро пожаловать в REKHL CARDS!\n\n" + USER_COMMANDS_TEXT
+        )
 
 # Выдача карточки (с баффами и seen_cards)
 async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -596,6 +608,70 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     balance = get_coins(user.id)
     await update.message.reply_text(f"💰 Ваш баланс: {balance} монет")
+
+# ============================ ЕЖЕДНЕВНАЯ НАГРАДА ============================
+async def daily_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user.id), {})
+    last_daily = user_data.get("last_daily", 0)
+    current_time = time.time()
+    elapsed = current_time - last_daily
+
+    if elapsed < DAILY_COOLDOWN_SECONDS:
+        remaining = DAILY_COOLDOWN_SECONDS - elapsed
+        hours = int(remaining // 3600)
+        minutes = int((remaining % 3600) // 60)
+        await update.message.reply_text(
+            f"⏳ Вы уже забирали ежедневную награду.\n"
+            f"Следующая награда будет доступна через: {hours}ч {minutes}мин"
+        )
+        return
+
+    # Начисляем фиксированные монеты
+    new_balance = update_coins(user.id, DAILY_COINS_AMOUNT)
+
+    # Обновляем дату последнего получения
+    user_data["last_daily"] = current_time
+    users[str(user.id)] = user_data
+    save_data(USERS_FILE, users)
+
+    message = (
+        f"🎁 <b>Ежедневная награда получена!</b>\n\n"
+        f"💰 +{DAILY_COINS_AMOUNT} монет\n"
+        f"💰 Новый баланс: {new_balance} монет\n"
+    )
+
+    # Шанс дополнительно получить случайную карточку
+    if random.random() < DAILY_CARD_CHANCE:
+        rarities = load_data(RARITIES_FILE, [])
+        droppable_rarities = [r["name"] for r in rarities if r.get("droppable", True)]
+        all_cards = load_data(CARDS_FILE, [])
+        droppable_cards = [c for c in all_cards if c["rarity"] in droppable_rarities]
+        if not droppable_cards:
+            droppable_cards = all_cards
+        if droppable_cards:
+            card = random.choice(droppable_cards)
+            user_data = users.get(str(user.id), {})
+            if "cards" not in user_data:
+                user_data["cards"] = []
+            user_data["cards"].append(card["id"])
+            users[str(user.id)] = user_data
+            save_data(USERS_FILE, users)
+            add_seen_card(user.id, card["id"])
+            message += (
+                f"\n🃏 Бонус! Вам выпала карточка:\n"
+                f"🏷 {card['name']} ({get_rarity_emoji(card['rarity'])} {card['rarity']})"
+            )
+
+    await update.message.reply_text(message, parse_mode="HTML")
 
 # Магазин
 async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1513,41 +1589,60 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             coins_leaders.append((uid, coins))
     coins_leaders.sort(key=lambda x: x[1], reverse=True)
     coins_top = coins_leaders[:5]
+
     users_data = load_data(USERS_FILE, {})
     cards_data = load_data(CARDS_FILE, [])
     rare_cards = [card["id"] for card in cards_data if card["rarity"] in ["Легендарная", "Эксклюзивная"]]
+
     rare_leaders = []
+    total_cards_leaders = []
+    unique_cards_leaders = []
+    buff_leaders = []
+
     for user_id, user_data in users_data.items():
         uid = int(user_id)
-        if uid not in exclude_ids:
-            user_cards = user_data.get("cards", [])
-            rare_count = sum(1 for card_id in user_cards if card_id in rare_cards)
-            rare_leaders.append((uid, rare_count))
+        if uid in exclude_ids:
+            continue
+        user_cards = user_data.get("cards", [])
+        rare_count = sum(1 for card_id in user_cards if card_id in rare_cards)
+        rare_leaders.append((uid, rare_count))
+        total_cards_leaders.append((uid, len(user_cards)))
+        unique_cards_leaders.append((uid, len(set(user_cards))))
+        buff = user_data.get("buff_card")
+        buff_level = buff.get("level", 0) if buff else 0
+        if buff_level > 0:
+            buff_leaders.append((uid, buff_level))
+
     rare_leaders.sort(key=lambda x: x[1], reverse=True)
+    total_cards_leaders.sort(key=lambda x: x[1], reverse=True)
+    unique_cards_leaders.sort(key=lambda x: x[1], reverse=True)
+    buff_leaders.sort(key=lambda x: x[1], reverse=True)
+
     rare_top = rare_leaders[:5]
-    message = "<b>🏆 Таблица лидеров</b>\n\n"
-    message += "<b>💰 Топ по монетам:</b>\n"
-    if coins_top:
-        for i, (user_id, coins) in enumerate(coins_top, 1):
+    total_cards_top = total_cards_leaders[:5]
+    unique_cards_top = unique_cards_leaders[:5]
+    buff_top = buff_leaders[:5]
+
+    async def format_section(title: str, entries, unit: str) -> str:
+        section = f"\n<b>{title}</b>\n"
+        if not entries:
+            return section + "Нет данных\n"
+        for i, (user_id, value) in enumerate(entries, 1):
             try:
                 user_chat = await context.bot.get_chat(user_id)
                 username = user_chat.username or f"ID: {user_id}"
-                message += f"{i}. @{username}: {coins} монет\n"
-            except:
-                message += f"{i}. ID {user_id}: {coins} монет\n"
-    else:
-        message += "Нет данных\n"
-    message += "\n<b>🃏 Топ по редким карточкам:</b>\n"
-    if rare_top:
-        for i, (user_id, count) in enumerate(rare_top, 1):
-            try:
-                user_chat = await context.bot.get_chat(user_id)
-                username = user_chat.username or f"ID: {user_id}"
-                message += f"{i}. @{username}: {count} карточек\n"
-            except:
-                message += f"{i}. ID {user_id}: {count} карточек\n"
-    else:
-        message += "Нет данных\n"
+                section += f"{i}. @{username}: {value} {unit}\n"
+            except Exception:
+                section += f"{i}. ID {user_id}: {value} {unit}\n"
+        return section
+
+    message = "<b>🏆 Таблица лидеров</b>\n"
+    message += await format_section("💰 Топ по монетам:", coins_top, "монет")
+    message += await format_section("🃏 Топ по редким карточкам:", rare_top, "карточек")
+    message += await format_section("📚 Топ по общему количеству карточек:", total_cards_top, "карточек")
+    message += await format_section("📖 Рейтинг по коллекциям (уникальные карточки):", unique_cards_top, "уникальных карточек")
+    message += await format_section("⚡ Топ по уровню баффа:", buff_top, "уровень")
+
     await update.message.reply_text(message, parse_mode="HTML")
 
 # ============================ КАЗИНО ============================
@@ -1576,34 +1671,50 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     streak = get_casino_streak(user.id)
     win_chance = max(0.1, 0.5 - streak * 0.05)
     if random.random() < win_chance:
-        multipliers = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+        # Пул множителей для "удачного" броска. 0 / 0.25 / 0.5 / 0.75 всё ещё
+        # можно получить - но это НЕ выигрыш, просто частичный (или полный) возврат ставки.
+        multipliers = [0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
         multiplier = random.choice(multipliers)
-        win = int(bet * multiplier)
-        set_casino_streak(user.id, streak + 1)
-        update_coins(user.id, -bet)
-        update_coins(user.id, win)
-        new_balance = get_coins(user.id)
-        await update.message.reply_text(
-            f"🎰 <b>Казино</b>\n\n"
-            f"Ставка: {bet} монет\n"
-            f"Множитель: x{multiplier:.2f}\n"
-            f"🎉 Вы выиграли! +{win} монет\n"
-            f"💰 Новый баланс: {new_balance} монет\n"
-            f"🔥 Серия побед: {streak+1}",
-            parse_mode="HTML"
-        )
     else:
+        # Гарантированный проигрыш без шанса на возврат
+        multiplier = 0
+
+    payout = int(bet * multiplier)
+    net = payout - bet  # реальное изменение баланса
+    update_coins(user.id, -bet)
+    update_coins(user.id, payout)
+    new_balance = get_coins(user.id)
+
+    if multiplier > 1.0:
+        # Настоящий выигрыш
+        new_streak = streak + 1
+        set_casino_streak(user.id, new_streak)
+        result_line = f"🎉 Вы выиграли! +{net} монет"
+        streak_line = f"🔥 Серия побед: {new_streak}"
+    elif multiplier == 1.0:
+        # Просто повезло - ставка вернулась, ни выигрыша, ни проигрыша
+        result_line = "😐 Повезло! Ставка вернулась, вы остались при своих (0)"
+        streak_line = "🔥 Серия побед не изменилась"
+    elif multiplier > 0:
+        # Частичный проигрыш - часть ставки вернулась, но по сути минус
         set_casino_streak(user.id, 0)
-        update_coins(user.id, -bet)
-        new_balance = get_coins(user.id)
-        await update.message.reply_text(
-            f"🎰 <b>Казино</b>\n\n"
-            f"Ставка: {bet} монет\n"
-            f"😞 Вы проиграли. -{bet} монет\n"
-            f"💰 Новый баланс: {new_balance} монет\n"
-            f"🔥 Серия побед сброшена.",
-            parse_mode="HTML"
-        )
+        result_line = f"😞 Вы проиграли часть ставки. Вернулось {payout} из {bet} ({net} монет)"
+        streak_line = "🔥 Серия побед сброшена."
+    else:
+        # Полный проигрыш
+        set_casino_streak(user.id, 0)
+        result_line = f"💀 Вы проиграли всё. -{bet} монет"
+        streak_line = "🔥 Серия побед сброшена."
+
+    await update.message.reply_text(
+        f"🎰 <b>Казино</b>\n\n"
+        f"Ставка: {bet} монет\n"
+        f"Множитель: x{multiplier:.2f}\n"
+        f"{result_line}\n"
+        f"💰 Новый баланс: {new_balance} монет\n"
+        f"{streak_line}",
+        parse_mode="HTML"
+    )
 
 # ============================ МОНЕТКА ============================
 async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2135,16 +2246,22 @@ async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text("ℹ️ Использование: /create_match <команда1> <команда2> <ДД.ММ.ГГГГ ЧЧ:ММ>")
+        await update.message.reply_text(
+            "ℹ️ Использование: /create_match <команда1> <команда2> <часы_приёма_ставок>\n"
+            "Пример: /create_match ЦСКА СКА 3\n"
+            "(бот будет принимать ставки на этот матч в течение 3 часов с момента создания)"
+        )
         return
     team1 = args[0]
     team2 = args[1]
-    time_str = " ".join(args[2:])
     try:
-        deadline = datetime.strptime(time_str, "%d.%m.%Y %H:%M")
+        hours = float(args[2].replace(",", "."))
+        if hours <= 0:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Неверный формат времени. Используйте ДД.ММ.ГГГГ ЧЧ:ММ")
+        await update.message.reply_text("❌ Количество часов должно быть положительным числом. Пример: 3 или 1.5")
         return
+    deadline = datetime.now() + timedelta(hours=hours)
     events = load_data(EVENTS_FILE, [])
     new_id = max([e["id"] for e in events], default=0) + 1
     outcomes = generate_outcomes()
@@ -2155,6 +2272,7 @@ async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "team1": team1,
         "team2": team2,
         "deadline": deadline.timestamp(),
+        "betting_hours": hours,
         "status": "active",
         "outcomes": outcomes,
         "winning_outcome_id": None,
@@ -2162,7 +2280,7 @@ async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     })
     save_data(EVENTS_FILE, events)
     await update.message.reply_text(f"✅ Матч {team1} - {team2} создан (ID: {new_id}).\n"
-                                    f"Приём ставок до {deadline.strftime('%d.%m.%Y %H:%M')}.\n"
+                                    f"Приём ставок открыт на {hours} ч. - до {deadline.strftime('%d.%m.%Y %H:%M')}.\n"
                                     "Исходы созданы автоматически.")
 
 async def finish_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2393,6 +2511,273 @@ async def my_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message += f"   Сумма: {b['amount']} монет, Статус: {status_emoji.get(b['status'], '❓')} {status_text.get(b['status'], 'Неизвестно')}\n\n"
     await update.message.reply_text(message, parse_mode="HTML")
 
+# ============================ РЕЙТИНГОВЫЙ РЕЖИМ ============================
+
+async def rating_team_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return ConversationHandler.END
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return ConversationHandler.END
+    collection_msg = await show_collection_with_ids(user.id)
+    users = load_data(USERS_FILE, {})
+    user_cards = users.get(str(user.id), {}).get("cards", [])
+    if len(set(user_cards)) < 4:
+        await update.message.reply_text(
+            "❌ Для составления команды нужно минимум 4 РАЗНЫЕ карточки в коллекции "
+            "(1 вратарь + 3 полевых игрока). Получите больше карточек через /get_card."
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(collection_msg, parse_mode="HTML")
+    await update.message.reply_text(
+        "🥅 Введите ID карточки, которая будет вашим ВРАТАРЁМ:"
+    )
+    return RATING_TEAM_GK
+
+async def rating_team_gk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    try:
+        gk_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Введите числовой ID карточки.")
+        return RATING_TEAM_GK
+    users = load_data(USERS_FILE, {})
+    user_cards = users.get(str(user.id), {}).get("cards", [])
+    if gk_id not in user_cards:
+        await update.message.reply_text("❌ У вас нет такой карточки. Проверьте ID и попробуйте снова.")
+        return RATING_TEAM_GK
+    context.user_data["rating_gk"] = gk_id
+    await update.message.reply_text(
+        "⚔️ Теперь введите ID трёх ПОЛЕВЫХ игроков через запятую (все разные и не совпадают с вратарём).\n"
+        "Пример: 2, 5, 7"
+    )
+    return RATING_TEAM_FIELD
+
+async def rating_team_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    raw = update.message.text.strip()
+    try:
+        field_ids = [int(x.strip()) for x in raw.split(",")]
+    except ValueError:
+        await update.message.reply_text("❌ Введите три ID через запятую, например: 2, 5, 7")
+        return RATING_TEAM_FIELD
+    if len(field_ids) != 3:
+        await update.message.reply_text("❌ Нужно указать ровно 3 карточки через запятую.")
+        return RATING_TEAM_FIELD
+    gk_id = context.user_data.get("rating_gk")
+    all_ids = [gk_id] + field_ids
+    if len(set(all_ids)) != 4:
+        await update.message.reply_text("❌ Все 4 карточки (вратарь + 3 полевых) должны быть РАЗНЫМИ. Попробуйте снова.")
+        return RATING_TEAM_FIELD
+    users = load_data(USERS_FILE, {})
+    user_cards = users.get(str(user.id), {}).get("cards", [])
+    missing = [cid for cid in field_ids if cid not in user_cards]
+    if missing:
+        await update.message.reply_text(f"❌ У вас нет карточек с ID: {', '.join(map(str, missing))}. Попробуйте снова.")
+        return RATING_TEAM_FIELD
+
+    set_rating_team(user.id, gk_id, field_ids)
+    all_cards = load_data(CARDS_FILE, [])
+    card_map = {c["id"]: c for c in all_cards}
+    gk_card = card_map.get(gk_id)
+    lines = [f"🥅 Вратарь: {gk_card['name'] if gk_card else gk_id}"]
+    for fid in field_ids:
+        fc = card_map.get(fid)
+        lines.append(f"⚔️ Полевой: {fc['name'] if fc else fid}")
+    await update.message.reply_text(
+        "✅ Состав сохранён!\n\n" + "\n".join(lines) + "\n\nТеперь используйте /find_match, чтобы найти соперника."
+    )
+    context.user_data.pop("rating_gk", None)
+    return ConversationHandler.END
+
+async def cancel_rating_team(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Составление команды отменено.")
+    context.user_data.pop("rating_gk", None)
+    return ConversationHandler.END
+
+async def rating_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    elo = get_rating_elo(user.id)
+    team = get_rating_team(user.id)
+    if not team:
+        await update.message.reply_text(
+            f"⭐ Ваш рейтинг: {elo}\n\n❌ У вас ещё нет состава. Используйте /rating_team, чтобы его создать."
+        )
+        return
+    all_cards = load_data(CARDS_FILE, [])
+    card_map = {c["id"]: c for c in all_cards}
+    gk_card = card_map.get(team["gk"])
+    lines = [f"🥅 Вратарь: {gk_card['name'] if gk_card else team['gk']}"]
+    for fid in team["field"]:
+        fc = card_map.get(fid)
+        lines.append(f"⚔️ Полевой: {fc['name'] if fc else fid}")
+    await update.message.reply_text(f"⭐ Ваш рейтинг: {elo}\n\n" + "\n".join(lines))
+
+def _team_strength(team: dict, card_map: dict) -> float:
+    gk_power = get_card_power(card_map.get(team["gk"], {}))
+    field_power = sum(get_card_power(card_map.get(fid, {})) for fid in team["field"])
+    return gk_power * 1.5 + field_power
+
+async def _get_display_name(context: ContextTypes.DEFAULT_TYPE, user_id) -> str:
+    if user_id is None:
+        return "Бот-соперник"
+    try:
+        chat = await context.bot.get_chat(user_id)
+        return f"@{chat.username}" if chat.username else f"Игрок {user_id}"
+    except Exception:
+        return f"Игрок {user_id}"
+
+def _generate_bot_team() -> dict:
+    all_cards = load_data(CARDS_FILE, [])
+    if len(all_cards) < 4:
+        # На случай очень маленькой базы карточек - дублировать нельзя, но и падать не надо
+        ids = [c["id"] for c in all_cards]
+        while len(ids) < 4:
+            ids.append(ids[0] if ids else 1)
+        return {"gk": ids[0], "field": ids[1:4]}
+    chosen = random.sample(all_cards, 4)
+    return {"gk": chosen[0]["id"], "field": [c["id"] for c in chosen[1:4]]}
+
+HIT_EVENTS = [
+    "💥 {team} наносит жёсткий силовой приём!",
+    "🥅 {team} упускает стопроцентный момент!",
+    "🧤 Вратарь соперника вытаскивает шайбу из девятки против {team}!",
+    "🥊 Игрок команды {team} отправляется на скамейку штрафников (2 минуты)!",
+]
+GOAL_EVENTS = [
+    "🚨 ГОЛ! {team} забрасывает шайбу!",
+    "⚡ {team} реализует большинство и открывает счёт!",
+    "🎯 Точный бросок в упор - {team} забивает красивый гол!",
+]
+
+async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_b):
+    """user_b может быть None (матч против бота)."""
+    team_a = get_rating_team(user_a)
+    team_b = get_rating_team(user_b) if user_b else _generate_bot_team()
+
+    all_cards = load_data(CARDS_FILE, [])
+    card_map = {c["id"]: c for c in all_cards}
+
+    strength_a = _team_strength(team_a, card_map)
+    strength_b = _team_strength(team_b, card_map)
+    total = strength_a + strength_b if (strength_a + strength_b) > 0 else 1
+    p_a = strength_a / total
+
+    name_a = await _get_display_name(context, user_a)
+    name_b = await _get_display_name(context, user_b)
+
+    goals_a, goals_b = 0, 0
+    highlights = []
+    for period in range(1, 4):
+        highlights.append(f"\n<b>Период {period}:</b>")
+        num_events = random.randint(2, 4)
+        for _ in range(num_events):
+            acting_team_is_a = random.random() < p_a
+            team_name = name_a if acting_team_is_a else name_b
+            if random.random() < 0.35:
+                event = random.choice(GOAL_EVENTS).format(team=team_name)
+                if acting_team_is_a:
+                    goals_a += 1
+                else:
+                    goals_b += 1
+            else:
+                event = random.choice(HIT_EVENTS).format(team=team_name)
+            highlights.append(event)
+
+    winner = None
+    if goals_a > goals_b:
+        winner = user_a
+    elif goals_b > goals_a:
+        winner = user_b  # может быть None (победил бот)
+
+    # Обновление ELO только для реальных пользователей
+    elo_a = get_rating_elo(user_a)
+    elo_b = get_rating_elo(user_b) if user_b else 1000
+    K = 32
+    expected_a = 1 / (1 + 10 ** ((elo_b - elo_a) / 400))
+    if goals_a > goals_b:
+        score_a = 1.0
+    elif goals_a < goals_b:
+        score_a = 0.0
+    else:
+        score_a = 0.5
+    new_elo_a = round(elo_a + K * (score_a - expected_a))
+    set_rating_elo(user_a, new_elo_a)
+    if user_b:
+        expected_b = 1 - expected_a
+        new_elo_b = round(elo_b + K * ((1 - score_a) - expected_b))
+        set_rating_elo(user_b, new_elo_b)
+
+    result_text_a = "🏆 Победа!" if goals_a > goals_b else ("🤝 Ничья." if goals_a == goals_b else "😞 Поражение.")
+    summary_a = (
+        f"⚔️ <b>Матч завершён: {name_a} {goals_a}:{goals_b} {name_b}</b>\n"
+        + "".join(f"\n{h}" for h in highlights)
+        + f"\n\n{result_text_a}\n⭐ Рейтинг: {elo_a} → {new_elo_a}"
+    )
+    try:
+        await context.bot.send_message(user_a, summary_a, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Не удалось отправить результат матча пользователю {user_a}: {e}")
+
+    if user_b:
+        result_text_b = "🏆 Победа!" if goals_b > goals_a else ("🤝 Ничья." if goals_a == goals_b else "😞 Поражение.")
+        summary_b = (
+            f"⚔️ <b>Матч завершён: {name_a} {goals_a}:{goals_b} {name_b}</b>\n"
+            + "".join(f"\n{h}" for h in highlights)
+            + f"\n\n{result_text_b}\n⭐ Рейтинг: {elo_b} → {new_elo_b}"
+        )
+        try:
+            await context.bot.send_message(user_b, summary_b, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить результат матча пользователю {user_b}: {e}")
+
+async def _wait_and_fallback_to_bot(context: ContextTypes.DEFAULT_TYPE, user_id: int, wait_seconds: int = 90):
+    await asyncio.sleep(wait_seconds)
+    queue = context.bot_data.setdefault("rating_queue", [])
+    entry = next((q for q in queue if q["user_id"] == user_id), None)
+    if not entry:
+        return  # уже нашли соперника
+    queue.remove(entry)
+    try:
+        await context.bot.send_message(user_id, "🤖 Соперник не найден за отведённое время - вы сыграете с ботом.")
+    except Exception:
+        pass
+    await _simulate_match(context, user_id, None)
+
+async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    if not get_rating_team(user.id):
+        await update.message.reply_text("❌ У вас нет состава. Сначала используйте /rating_team.")
+        return
+
+    queue = context.bot_data.setdefault("rating_queue", [])
+    queue[:] = [q for q in queue if q["user_id"] != user.id]
+
+    opponent_entry = next((q for q in queue), None)
+    if opponent_entry:
+        queue.remove(opponent_entry)
+        await update.message.reply_text("⚔️ Соперник найден! Матч начнётся примерно через минуту...")
+        try:
+            await context.bot.send_message(opponent_entry["user_id"], "⚔️ Соперник найден! Матч начнётся примерно через минуту...")
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+        await _simulate_match(context, user.id, opponent_entry["user_id"])
+    else:
+        queue.append({"user_id": user.id, "joined": time.time()})
+        await update.message.reply_text(
+            "🔍 Ищем соперника... Если никого не найдётся в течение 90 секунд, вы сыграете с ботом."
+        )
+        asyncio.create_task(_wait_and_fallback_to_bot(context, user.id, 90))
+
 # ============================ MAIN ============================
 def main() -> None:
     os.makedirs(CARDS_IMAGE_DIR, exist_ok=True)
@@ -2473,7 +2858,6 @@ def main() -> None:
             ADMIN_SHOP_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_shop_duration)],
         },
         fallbacks=[CommandHandler("cancel", cancel_addshopitem)],
-        per_message=True,
     )
 
     editcard_conv_handler = ConversationHandler(
@@ -2486,7 +2870,6 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel_editcard)],
-        per_message=True,
     )
 
     craft_conv_handler = ConversationHandler(
@@ -2509,12 +2892,22 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel_promo)],
     )
 
+    rating_team_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("rating_team", rating_team_start)],
+        states={
+            RATING_TEAM_GK: [MessageHandler(filters.TEXT & ~filters.COMMAND, rating_team_gk)],
+            RATING_TEAM_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, rating_team_field)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_rating_team)],
+    )
+
     application.add_handler(addcard_conv_handler)
     application.add_handler(addrarity_conv_handler)
     application.add_handler(addshopitem_conv_handler)
     application.add_handler(editcard_conv_handler)
     application.add_handler(craft_conv_handler)
     application.add_handler(promo_conv_handler)
+    application.add_handler(rating_team_conv_handler)
 
     # Команды
     application.add_handler(CommandHandler("start", start))
@@ -2522,6 +2915,7 @@ def main() -> None:
     application.add_handler(CommandHandler("my_cards", show_collection))
     application.add_handler(CommandHandler("card_info", card_info))
     application.add_handler(CommandHandler("balance", show_balance))
+    application.add_handler(CommandHandler("daily", daily_claim))
     application.add_handler(CommandHandler("shop", show_shop))
     application.add_handler(CommandHandler("buy", buy_item))
     application.add_handler(CommandHandler("leaderboard", show_leaderboard))
@@ -2550,6 +2944,8 @@ def main() -> None:
     application.add_handler(CommandHandler("finish_match", finish_match))
     application.add_handler(CommandHandler("bet", bet_start))
     application.add_handler(CommandHandler("my_bets", my_bets))
+    application.add_handler(CommandHandler("find_match", find_match))
+    application.add_handler(CommandHandler("rating", rating_profile))
 
     # CallbackQueryHandler'ы
     application.add_handler(CallbackQueryHandler(admin_shop_type, pattern=r"^(reset|pack)"))
