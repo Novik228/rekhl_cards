@@ -794,7 +794,7 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if is_banned(user.id):
         await context.bot.delete_message(chat_id=message.chat_id, message_id=message.message_id)
         warn_msg = await message.reply_text("❌ Вы заблокированы в этом боте.")
-        time.sleep(5)
+        await asyncio.sleep(5)
         await context.bot.delete_message(chat_id=message.chat_id, message_id=warn_msg.message_id)
         return
     if not await is_subscribed(user.id, context):
@@ -804,7 +804,7 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"Подпишитесь здесь: {CHANNEL_LINK}\n"
             "После подписки отправьте /start"
         )
-        time.sleep(10)
+        await asyncio.sleep(10)
         await context.bot.delete_message(chat_id=message.chat_id, message_id=warn_msg.message_id)
 
 # ============================ АДМИН-КОМАНДЫ ============================
