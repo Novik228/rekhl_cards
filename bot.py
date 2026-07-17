@@ -39,7 +39,12 @@ SHOP_FILE = "shop.json"
 PROMOCODES_FILE = "promocodes.json"
 EVENTS_FILE = "events.json"
 BETS_FILE = "bets.json"
+CLANS_FILE = "clans.json"
 CARDS_IMAGE_DIR = "cards_images"
+
+# ============================ СИСТЕМА КЛАНОВ ============================
+CLAN_CREATE_COST = 1000          # стоимость создания клана
+CLAN_BUFF_TIERS = {1: 8, 2: 5, 3: 3}  # % бонуса к монетам по месту клана в рейтинге казны (1 - самый большой)
 
 # ============================ СОСТОЯНИЯ ============================
 ADMIN_CARD_NAME, ADMIN_CARD_RARITY, ADMIN_CARD_DESCRIPTION, ADMIN_CARD_IMAGE = range(4)
@@ -96,6 +101,27 @@ def is_moderator(user_id: int) -> bool:
 
 def has_admin_access(user_id: int) -> bool:
     return is_admin(user_id) or is_moderator(user_id)
+
+# ============================ ЛОГИ ДЕЙСТВИЙ МОДЕРАТОРОВ ============================
+async def log_moderator_action(context: ContextTypes.DEFAULT_TYPE, actor_id: int, action: str) -> None:
+    """Отправляет администратору лог о действии модератора (администратора не спамим о его же действиях)."""
+    if actor_id == ADMIN_ID:
+        return
+    try:
+        actor_name = f"ID {actor_id}"
+        try:
+            chat = await context.bot.get_chat(actor_id)
+            if chat.username:
+                actor_name = f"@{chat.username} (ID {actor_id})"
+        except Exception:
+            pass
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"🛡 <b>Лог модератора</b>\n👤 {html.escape(actor_name)}\n📋 {html.escape(action)}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Не удалось отправить лог модератора администратору: {e}")
 
 def get_rarity_emoji(rarity_name: str) -> str:
     rarities = load_data(RARITIES_FILE, [])
@@ -272,6 +298,103 @@ def set_rating_team(user_id: int, gk_id: int, field_ids: list):
     users[str(user_id)] = user_data
     save_data(USERS_FILE, users)
 
+# ============================ РЕЙТИНГ: ЗВАНИЯ И СТАТИСТИКА ============================
+RATING_TITLES = [
+    (1400, "🌌", "Легенда"),
+    (1300, "👑", "Элита"),
+    (1200, "💎", "Мастер"),
+    (1100, "🥇", "Профи"),
+    (1000, "🥈", "Полупрофи"),
+    (900, "⚪", "Любитель"),
+    (0, "🥉", "Новичок"),
+]
+
+def get_rating_title(elo: int):
+    for threshold, emoji, name in RATING_TITLES:
+        if elo >= threshold:
+            return emoji, name
+    return "🥉", "Новичок"
+
+def get_rating_stats(user_id: int) -> dict:
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    stats = user_data.get("rating_stats", {})
+    return {
+        "wins": stats.get("wins", 0),
+        "losses": stats.get("losses", 0),
+        "draws": stats.get("draws", 0),
+    }
+
+def add_rating_result(user_id: int, result: str) -> None:
+    """result: 'win' | 'loss' | 'draw'"""
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    stats = user_data.get("rating_stats", {"wins": 0, "losses": 0, "draws": 0})
+    key = {"win": "wins", "loss": "losses", "draw": "draws"}.get(result)
+    if key:
+        stats[key] = stats.get(key, 0) + 1
+    user_data["rating_stats"] = stats
+    users[str(user_id)] = user_data
+    save_data(USERS_FILE, users)
+
+# ============================ КЛАНЫ: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============================
+def load_clans() -> list:
+    return load_data(CLANS_FILE, [])
+
+def save_clans(clans: list) -> None:
+    save_data(CLANS_FILE, clans)
+
+def get_clan_by_id(clan_id):
+    if clan_id is None:
+        return None
+    clans = load_clans()
+    return next((c for c in clans if c["id"] == clan_id), None)
+
+def get_user_clan_id(user_id: int):
+    users = load_data(USERS_FILE, {})
+    return users.get(str(user_id), {}).get("clan_id")
+
+def set_user_clan_id(user_id: int, clan_id) -> None:
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    if clan_id is None:
+        user_data.pop("clan_id", None)
+    else:
+        user_data["clan_id"] = clan_id
+    users[str(user_id)] = user_data
+    save_data(USERS_FILE, users)
+
+def get_ranked_clans() -> list:
+    """Кланы, участвующие в рейтинге (есть участники и казна > 0), отсортированные по казне."""
+    clans = load_clans()
+    eligible = [c for c in clans if c.get("members") and c.get("treasury", 0) > 0]
+    return sorted(eligible, key=lambda c: c["treasury"], reverse=True)
+
+def get_clan_rank(clan_id) -> int:
+    """Место клана в рейтинге казны (1 = первое место), либо None, если клан не в рейтинге."""
+    if clan_id is None:
+        return None
+    ranked = get_ranked_clans()
+    for i, c in enumerate(ranked, 1):
+        if c["id"] == clan_id:
+            return i
+    return None
+
+def get_top_clan():
+    """Клан на первом месте рейтинга казны, либо None."""
+    ranked = get_ranked_clans()
+    return ranked[0] if ranked else None
+
+def get_clan_coin_multiplier(user_id: int) -> float:
+    """Небольшой бафф к получаемым монетам для участников топ-3 кланов по казне (топ-1 - самый большой)."""
+    clan_id = get_user_clan_id(user_id)
+    if clan_id is None:
+        return 1.0
+    rank = get_clan_rank(clan_id)
+    if rank in CLAN_BUFF_TIERS:
+        return 1.0 + CLAN_BUFF_TIERS[rank] / 100.0
+    return 1.0
+
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОФИЛЯ ========================
 def add_seen_card(user_id: int, card_id: int):
     users = load_data(USERS_FILE, {})
@@ -308,6 +431,13 @@ USER_COMMANDS_TEXT = (
     "/rating_team - собрать состав для рейтингового режима\n"
     "/find_match - найти соперника (рейтинговый режим)\n"
     "/rating - мой рейтинг и текущий состав\n\n"
+    "🏰 Кланы:\n"
+    "/create_clan <название> - создать клан (1000 монет)\n"
+    "/join_clan <ID> - вступить в клан\n"
+    "/leave_clan - покинуть клан\n"
+    "/clan_deposit <сумма> - пополнить казну клана\n"
+    "/clan_info [ID] - информация о клане\n"
+    "/clans - рейтинг кланов\n\n"
     "⏳ Карточку можно получать каждые 6 часов!"
 )
 
@@ -342,10 +472,7 @@ MODERATOR_ONLY_COMMANDS_TEXT = (
     "/admin_listrarities - список редкостей\n"
     "/admin_addshopitem - добавить товар в магазин\n"
     "/admin_listshop - список товаров\n"
-    "/admin_editcard <card_id> - изменить карточку\n"
-    "/create_promo - создать промокод\n"
-    "/create_match <команда1> <команда2> <часы> - создать матч (приём ставок N часов)\n"
-    "/finish_match <match_id> <счёт> - завершить матч"
+    "/admin_editcard <card_id> - изменить карточку"
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -508,7 +635,7 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_seen_card(user.id, card["id"])
 
     base_coins = random.randint(10, 50)
-    coin_multiplier = get_coin_bonus_multiplier(user.id)
+    coin_multiplier = get_coin_bonus_multiplier(user.id) * get_clan_coin_multiplier(user.id)
     coins_earned = int(base_coins * coin_multiplier)
     new_balance = update_coins(user.id, coins_earned)
     card_count = user_data["cards"].count(card["id"])
@@ -635,8 +762,10 @@ async def daily_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Начисляем фиксированные монеты
-    new_balance = update_coins(user.id, DAILY_COINS_AMOUNT)
+    # Начисляем фиксированные монеты (с учётом клан-баффа за место в топе казны)
+    clan_multiplier = get_clan_coin_multiplier(user.id)
+    daily_amount = int(DAILY_COINS_AMOUNT * clan_multiplier)
+    new_balance = update_coins(user.id, daily_amount)
 
     # Обновляем дату последнего получения
     user_data["last_daily"] = current_time
@@ -645,9 +774,12 @@ async def daily_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     message = (
         f"🎁 <b>Ежедневная награда получена!</b>\n\n"
-        f"💰 +{DAILY_COINS_AMOUNT} монет\n"
+        f"💰 +{daily_amount} монет\n"
         f"💰 Новый баланс: {new_balance} монет\n"
     )
+    if clan_multiplier > 1.0:
+        bonus_percent = round((clan_multiplier - 1.0) * 100)
+        message += f"🌟 Бонус клана (топ рейтинга казны): +{bonus_percent}%\n"
 
     # Шанс дополнительно получить случайную карточку
     if random.random() < DAILY_CARD_CHANCE:
@@ -861,6 +993,10 @@ async def admin_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     cards.append(new_card)
     save_data(CARDS_FILE, cards)
     await update.message.reply_text(f"✅ Карточка '{new_card['name']}' успешно добавлена!")
+    await log_moderator_action(
+        context, update.effective_user.id,
+        f"Добавил новую карточку: {new_card['name']} (ID: {new_id}, редкость: {new_card.get('rarity')})"
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -939,6 +1075,10 @@ async def admin_deletecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     save_data(USERS_FILE, users)
 
     await update.message.reply_text(f"✅ Карточка '{card['name']}' (ID: {card_id}) удалена из базы и из коллекций всех пользователей.")
+    await log_moderator_action(
+        context, update.effective_user.id,
+        f"Удалил карточку: {card['name']} (ID: {card_id})"
+    )
 
 async def admin_resettimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
@@ -1229,6 +1369,10 @@ async def admin_rarity_droppable(update: Update, context: ContextTypes.DEFAULT_T
         f"Смайлик: {new_rarity['emoji']}\n"
         f"Выпадает через /get_card: {'Да' if new_rarity['droppable'] else 'Нет'}"
     )
+    await log_moderator_action(
+        context, update.effective_user.id,
+        f"Добавил новую редкость: {new_rarity['name']} {new_rarity['emoji']}"
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1354,6 +1498,10 @@ async def admin_shop_duration(update: Update, context: ContextTypes.DEFAULT_TYPE
         card_names = [str(card_id) for card_id in new_item["cards"]]
         message += f"🃏 Карточки: {', '.join(card_names)}\n"
     await update.message.reply_text(message)
+    await log_moderator_action(
+        context, update.effective_user.id,
+        f"Добавил товар в магазин: {new_item['name']} (ID: {new_id}, цена: {new_item['price']})"
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1473,11 +1621,20 @@ async def edit_card_value(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         cards[card_index]["image"] = filename
         save_data(CARDS_FILE, cards)
         await update.message.reply_text("✅ Изображение карточки успешно обновлено!")
+        await log_moderator_action(
+            context, update.effective_user.id,
+            f"Изменил изображение карточки: {cards[card_index]['name']} (ID: {card_id})"
+        )
     else:
         new_value = update.message.text
+        old_value = cards[card_index].get(field)
         cards[card_index][field] = new_value
         save_data(CARDS_FILE, cards)
         await update.message.reply_text(f"✅ Поле '{field}' успешно обновлено!")
+        await log_moderator_action(
+            context, update.effective_user.id,
+            f"Изменил карточку (ID: {card_id}): поле '{field}' было «{old_value}» -> стало «{new_value}»"
+        )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1680,6 +1837,10 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         multiplier = 0
 
     payout = int(bet * multiplier)
+    if multiplier > 1.0:
+        # Небольшой бафф топ-1 клана применяется только к реальному выигрышу
+        clan_multiplier = get_clan_coin_multiplier(user.id)
+        payout = int(bet + (payout - bet) * clan_multiplier)
     net = payout - bet  # реальное изменение баланса
     update_coins(user.id, -bet)
     update_coins(user.id, payout)
@@ -1758,14 +1919,16 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if random.random() < win_chance:
         result = choice
         set_coin_streak(user.id, streak + 1)
+        clan_multiplier = get_clan_coin_multiplier(user.id)
+        win_amount = int(bet * 2 * clan_multiplier)
         update_coins(user.id, -bet)
-        update_coins(user.id, bet * 2)
+        update_coins(user.id, win_amount)
         new_balance = get_coins(user.id)
         await update.message.reply_text(
             f"🪙 <b>Монетка</b>\n\n"
             f"Ваш выбор: {choice}\n"
             f"Выпало: {result}!\n"
-            f"🎉 Вы выиграли! +{bet*2} монет\n"
+            f"🎉 Вы выиграли! +{win_amount} монет\n"
             f"💰 Новый баланс: {new_balance} монет\n"
             f"🔥 Серия побед: {streak+1}",
             parse_mode="HTML"
@@ -1983,8 +2146,8 @@ async def upgrade_buff_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ============================ ПРОМОКОДЫ ============================
 async def create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not has_admin_access(update.effective_user.id):
-        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
         return ConversationHandler.END
     await update.message.reply_text("Введите код промокода (латиница, без пробелов):")
     return PROMO_NAME
@@ -2241,8 +2404,8 @@ def generate_outcomes():
     return outcomes
 
 async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not has_admin_access(update.effective_user.id):
-        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
         return
     args = context.args
     if len(args) < 3:
@@ -2284,8 +2447,8 @@ async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                     "Исходы созданы автоматически.")
 
 async def finish_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not has_admin_access(update.effective_user.id):
-        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
         return
     args = context.args
     if len(args) < 2:
@@ -2641,19 +2804,116 @@ def _generate_bot_team() -> dict:
     return {"gk": chosen[0]["id"], "field": [c["id"] for c in chosen[1:4]]}
 
 HIT_EVENTS = [
-    "💥 {team} наносит жёсткий силовой приём!",
-    "🥅 {team} упускает стопроцентный момент!",
-    "🧤 Вратарь соперника вытаскивает шайбу из девятки против {team}!",
-    "🥊 Игрок команды {team} отправляется на скамейку штрафников (2 минуты)!",
+    "💥 {player} ({team}) наносит жёсткий силовой приём!",
+    "🥅 {player} ({team}) упускает стопроцентный момент!",
+    "🧤 Вратарь {gk} вытаскивает шайбу из девятки против {team}!",
+    "🥊 {player} ({team}) отправляется на скамейку штрафников (2 минуты)!",
+    "🏒 {player} ({team}) обыгрывает одного защитника, но бросок мимо створа!",
+    "🛡 Отличная силовая борьба у борта: {player} ({team}) выигрывает эпизод!",
+    "🚫 {gk} эффектно перекрывает угол и спасает свою команду от гола {team}!",
+    "🧊 {player} ({team}) бросает из выгодной позиции, но шайба попадает в штангу!",
+    "⏱ {player} ({team}) получает лишние 2 минуты штрафа за задержку клюшкой!",
+    "🤾 Вратарь {gk} совершает шпагат и вытаскивает верховой бросок {player}!",
+    "🌀 {player} ({team}) закручивает шайбу у ворот, но она проходит впритирку мимо штанги!",
+    "🧱 {gk} ловит шайбу прямо в ловушку после броска {player}!",
+    "🔨 {player} ({team}) пробивает от синей линии, но вратарь {gk} справляется без проблем!",
+    "🦵 Судья фиксирует подножку — {player} ({team}) удаляется на 2 минуты!",
+    "🧤 {gk} накрывает шайбу телом на пятаке, не дав {player} ({team}) добить!",
+    "🪃 {player} ({team}) бросает с неудобной руки — мимо ворот!",
+    "🧨 Взрывной проход {player} ({team}), но передача партнёру срывается!",
+    "🧊 Шайба со свистом пролетает над перекладиной после броска {player} ({team})!",
+    "🛑 {gk} читает игру и перехватывает пас в средней зоне против {team}!",
+    "🔁 {player} ({team}) бросает второй раз подряд — вратарь {gk} снова начеку!",
+    "🥋 Жёсткая борьба на пятаке — {player} ({team}) остаётся без шайбы!",
+    "📉 Реализация большинства не удаётся: {player} ({team}) мажет с близкой дистанции!",
+    "🧯 {gk} гасит опасный отскок после броска {player}!",
+    "⚔️ {player} ({team}) выигрывает силовую борьбу у борта, но время атаки истекает!",
+    "🎣 Обманное движение {player} ({team}) не проходит — {gk} не поддаётся на финт!",
+    "🕳 Бросок {player} ({team}) блокирует защитник в последний момент!",
 ]
 GOAL_EVENTS = [
-    "🚨 ГОЛ! {team} забрасывает шайбу!",
-    "⚡ {team} реализует большинство и открывает счёт!",
-    "🎯 Точный бросок в упор - {team} забивает красивый гол!",
+    "🚨 ГОЛ! {player} ({team}) забрасывает шайбу!",
+    "⚡ {player} ({team}) реализует большинство и открывает счёт!",
+    "🎯 Точный бросок в упор - {player} ({team}) забивает красивый гол!",
+    "🔥 {player} мощным щелчком в дальний угол оформляет гол за {team}!",
+    "🎉 {player} ({team}) подбирает шайбу на пятаке и заталкивает её в ворота!",
+    "🌟 {player} обыгрывает вратаря {gk} кистевым броском и забивает за {team}!",
+    "💫 {player} ({team}) забивает гол с передачи партнёра прямо в касание!",
+    "🚀 Невероятный бросок! {gk} даже не успевает среагировать — гол {player} ({team})!",
+    "🥅 {player} ({team}) добивает шайбу после отскока от борта и заносит её в сетку!",
+    "🏒 {player} эффектно обыгрывает защитников и хладнокровно поражает цель для {team}!",
+    "🧨 {player} ({team}) забивает буллитом, безупречно обыграв {gk}!",
+    "🎆 Красивая комбинация — {player} ({team}) завершает её точным броском в девятку!",
+    "🎇 {player} ({team}) продавливает {gk} и заталкивает шайбу в упор!",
+    "🌪 {player} закручивает шайбу над клюшкой {gk} — гол в пользу {team}!",
+    "🧠 Хитрый буллит-финт: {player} ({team}) переигрывает {gk} и забивает!",
+    "💣 Пушечный щелчок от синей линии — {player} ({team}) не оставляет шансов {gk}!",
+    "🎊 {player} эффектно замыкает прострел партнёра и забивает за {team}!",
+    "🪄 {player} ({team}) обыгрывает {gk} лёгким движением клюшки и закатывает шайбу!",
+    "🏹 {player} ({team}) бросает из-под защитника прямо в девятку — гол!",
+]
+NEUTRAL_EVENTS = [
+    "📣 Трибуны поддерживают {team} громким скандированием!",
+    "🧊 Судья останавливает игру для заливки льда.",
+    "🗣 Тренер {team} берёт тайм-аут для перестроения игры.",
+    "❄️ Обе команды обмениваются жёсткими стыками у синей линии.",
+    "📋 Тренерский штаб {team} меняет тройку нападения.",
+    "🎥 Повтор на табло вызывает бурную реакцию трибун.",
+    "🩹 Игрок {team} получает лёгкий ушиб, но остаётся на льду.",
+    "🔄 {team} производит замену вратаря на паузе в игре.",
+    "📢 Диктор объявляет статистику бросков по воротам.",
+    "🥶 Короткая пауза на смазку коньков — игра вот-вот продолжится.",
+    "🎶 Диджей арены заводит трибуны музыкой во время паузы.",
+    "🧤 {player} ({team}) меняет сломанную клюшку у скамейки запасных.",
+    "📸 Оператор ловит крупный план {player} ({team}) для повтора на экране.",
+    "🍿 Болельщики {team} скандируют кричалку в поддержку своей команды.",
+    "🧊 Мелкая заминка — рабочие устраняют выбоину на льду.",
+    "🎙 Комментатор отмечает высокий темп сегодняшнего матча.",
+    "🥅 Судьи проверяют крепление ворот после силового приёма.",
+    "📝 Статистики фиксируют очередной силовой приём {player} ({team}).",
 ]
 
+def _pick_field_player(team: dict, card_map: dict) -> int:
+    """Выбирает полевого игрока команды с учётом его силы (более сильные игроки чаще участвуют в эпизодах)."""
+    field_ids = team["field"]
+    weights = [max(1, get_card_power(card_map.get(fid, {}))) for fid in field_ids]
+    return random.choices(field_ids, weights=weights, k=1)[0]
+
+def _card_name(card_id, card_map: dict) -> str:
+    card = card_map.get(card_id)
+    return card["name"] if card else f"Игрок {card_id}"
+
+def _generate_period_events(team_a: dict, team_b: dict, card_map: dict, name_a: str, name_b: str, p_a: float):
+    """Генерирует события одного периода. Возвращает (events_text_list, goals_a, goals_b)."""
+    events = []
+    goals_a = 0
+    goals_b = 0
+    num_events = random.randint(4, 6)
+    for _ in range(num_events):
+        acting_a = random.random() < p_a
+        acting_team = team_a if acting_a else team_b
+        defending_team = team_b if acting_a else team_a
+        team_name = name_a if acting_a else name_b
+        player_name = _card_name(_pick_field_player(acting_team, card_map), card_map)
+        gk_name = _card_name(defending_team["gk"], card_map)
+
+        roll = random.random()
+        if roll < 0.28:
+            event = random.choice(GOAL_EVENTS).format(team=team_name, player=player_name, gk=gk_name)
+            if acting_a:
+                goals_a += 1
+            else:
+                goals_b += 1
+        elif roll < 0.80:
+            event = random.choice(HIT_EVENTS).format(team=team_name, player=player_name, gk=gk_name)
+        else:
+            event = random.choice(NEUTRAL_EVENTS).format(team=team_name, player=player_name, gk=gk_name)
+        events.append(event)
+    return events, goals_a, goals_b
+
 async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_b):
-    """user_b может быть None (матч против бота)."""
+    """user_b может быть None (матч против бота). Результаты каждого периода отправляются
+    игрокам сразу же по мере симуляции, а не одним большим сообщением в конце."""
     team_a = get_rating_team(user_a)
     team_b = get_rating_team(user_b) if user_b else _generate_bot_team()
 
@@ -2668,29 +2928,31 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
     name_a = await _get_display_name(context, user_a)
     name_b = await _get_display_name(context, user_b)
 
-    goals_a, goals_b = 0, 0
-    highlights = []
-    for period in range(1, 4):
-        highlights.append(f"\n<b>Период {period}:</b>")
-        num_events = random.randint(2, 4)
-        for _ in range(num_events):
-            acting_team_is_a = random.random() < p_a
-            team_name = name_a if acting_team_is_a else name_b
-            if random.random() < 0.35:
-                event = random.choice(GOAL_EVENTS).format(team=team_name)
-                if acting_team_is_a:
-                    goals_a += 1
-                else:
-                    goals_b += 1
-            else:
-                event = random.choice(HIT_EVENTS).format(team=team_name)
-            highlights.append(event)
+    async def send_both(text: str):
+        try:
+            await context.bot.send_message(user_a, text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение пользователю {user_a}: {e}")
+        if user_b:
+            try:
+                await context.bot.send_message(user_b, text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Не удалось отправить сообщение пользователю {user_b}: {e}")
 
-    winner = None
-    if goals_a > goals_b:
-        winner = user_a
-    elif goals_b > goals_a:
-        winner = user_b  # может быть None (победил бот)
+    await send_both(f"⚔️ <b>Матч начинается: {name_a} 🆚 {name_b}</b>\nПервый период стартует прямо сейчас!")
+
+    goals_a, goals_b = 0, 0
+    for period in range(1, 4):
+        await asyncio.sleep(4)  # небольшая пауза для динамики матча вживую
+        events, p_goals_a, p_goals_b = _generate_period_events(team_a, team_b, card_map, name_a, name_b, p_a)
+        goals_a += p_goals_a
+        goals_b += p_goals_b
+        period_text = (
+            f"🏒 <b>Период {period} завершён</b>\n"
+            + "\n".join(events)
+            + f"\n\n📊 Счёт после {period}-го периода: <b>{goals_a}:{goals_b}</b>"
+        )
+        await send_both(period_text)
 
     # Обновление ELO только для реальных пользователей
     elo_a = get_rating_elo(user_a)
@@ -2712,9 +2974,8 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
 
     result_text_a = "🏆 Победа!" if goals_a > goals_b else ("🤝 Ничья." if goals_a == goals_b else "😞 Поражение.")
     summary_a = (
-        f"⚔️ <b>Матч завершён: {name_a} {goals_a}:{goals_b} {name_b}</b>\n"
-        + "".join(f"\n{h}" for h in highlights)
-        + f"\n\n{result_text_a}\n⭐ Рейтинг: {elo_a} → {new_elo_a}"
+        f"🏁 <b>Матч завершён: {name_a} {goals_a}:{goals_b} {name_b}</b>\n\n"
+        f"{result_text_a}\n⭐ Рейтинг: {elo_a} → {new_elo_a}"
     )
     try:
         await context.bot.send_message(user_a, summary_a, parse_mode="HTML")
@@ -2724,9 +2985,8 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
     if user_b:
         result_text_b = "🏆 Победа!" if goals_b > goals_a else ("🤝 Ничья." if goals_a == goals_b else "😞 Поражение.")
         summary_b = (
-            f"⚔️ <b>Матч завершён: {name_a} {goals_a}:{goals_b} {name_b}</b>\n"
-            + "".join(f"\n{h}" for h in highlights)
-            + f"\n\n{result_text_b}\n⭐ Рейтинг: {elo_b} → {new_elo_b}"
+            f"🏁 <b>Матч завершён: {name_a} {goals_a}:{goals_b} {name_b}</b>\n\n"
+            f"{result_text_b}\n⭐ Рейтинг: {elo_b} → {new_elo_b}"
         )
         try:
             await context.bot.send_message(user_b, summary_b, parse_mode="HTML")
@@ -2764,19 +3024,266 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     opponent_entry = next((q for q in queue), None)
     if opponent_entry:
         queue.remove(opponent_entry)
-        await update.message.reply_text("⚔️ Соперник найден! Матч начнётся примерно через минуту...")
+        await update.message.reply_text("⚔️ Соперник найден! Матч начинается прямо сейчас...")
         try:
-            await context.bot.send_message(opponent_entry["user_id"], "⚔️ Соперник найден! Матч начнётся примерно через минуту...")
+            await context.bot.send_message(opponent_entry["user_id"], "⚔️ Соперник найден! Матч начинается прямо сейчас...")
         except Exception:
             pass
-        await asyncio.sleep(60)
-        await _simulate_match(context, user.id, opponent_entry["user_id"])
+        asyncio.create_task(_simulate_match(context, user.id, opponent_entry["user_id"]))
     else:
         queue.append({"user_id": user.id, "joined": time.time()})
         await update.message.reply_text(
             "🔍 Ищем соперника... Если никого не найдётся в течение 90 секунд, вы сыграете с ботом."
         )
         asyncio.create_task(_wait_and_fallback_to_bot(context, user.id, 90))
+
+# ============================ СИСТЕМА КЛАНОВ ============================
+async def create_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    if not context.args:
+        await update.message.reply_text(f"ℹ️ Использование: /create_clan <название>\n💰 Стоимость создания: {CLAN_CREATE_COST} монет.")
+        return
+    if get_user_clan_id(user.id):
+        await update.message.reply_text("❌ Вы уже состоите в клане. Сначала покиньте его через /leave_clan.")
+        return
+
+    name = " ".join(context.args).strip()
+    if not (2 <= len(name) <= 32):
+        await update.message.reply_text("❌ Название клана должно быть от 2 до 32 символов.")
+        return
+
+    clans = load_clans()
+    if any(c["name"].lower() == name.lower() for c in clans):
+        await update.message.reply_text("❌ Клан с таким названием уже существует. Выберите другое название.")
+        return
+
+    balance = get_coins(user.id)
+    if balance < CLAN_CREATE_COST:
+        await update.message.reply_text(f"❌ Для создания клана нужно {CLAN_CREATE_COST} монет. У вас: {balance}.")
+        return
+
+    update_coins(user.id, -CLAN_CREATE_COST)
+    new_id = max((c["id"] for c in clans), default=0) + 1
+    clan = {
+        "id": new_id,
+        "name": name,
+        "owner": user.id,
+        "members": [user.id],
+        "treasury": 0,
+        "created": time.time()
+    }
+    clans.append(clan)
+    save_clans(clans)
+    set_user_clan_id(user.id, new_id)
+
+    await update.message.reply_text(
+        f"🏰 <b>Клан «{name}» создан!</b>\n"
+        f"🆔 ID клана: {new_id}\n"
+        f"💰 С вашего баланса списано {_fmt_coins(CLAN_CREATE_COST)} монет.\n\n"
+        f"👥 Приглашайте участников: /join_clan {new_id}\n"
+        f"🏦 Пополняйте казну клана: /clan_deposit <сумма>\n"
+        f"📊 Топ-3 клана по казне получают бафф к монетам — смотрите /clans",
+        parse_mode="HTML"
+    )
+
+async def join_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    if get_user_clan_id(user.id):
+        await update.message.reply_text("❌ Вы уже состоите в клане. Сначала покиньте его через /leave_clan.")
+        return
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /join_clan <ID клана>\nСписок кланов: /clans")
+        return
+    try:
+        clan_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Укажите числовой ID клана.")
+        return
+
+    clans = load_clans()
+    clan = next((c for c in clans if c["id"] == clan_id), None)
+    if not clan:
+        await update.message.reply_text("❌ Клан с таким ID не найден. Список кланов: /clans")
+        return
+
+    clan["members"].append(user.id)
+    save_clans(clans)
+    set_user_clan_id(user.id, clan_id)
+    await update.message.reply_text(
+        f"✅ Вы вступили в клан «{clan['name']}»!\n"
+        f"👥 Теперь в клане: {len(clan['members'])} чел.\n"
+        f"🏦 Казна клана: {_fmt_coins(clan.get('treasury', 0))} монет.\n"
+        f"ℹ️ Подробности: /clan_info"
+    )
+
+async def leave_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    clan_id = get_user_clan_id(user.id)
+    if not clan_id:
+        await update.message.reply_text("❌ Вы не состоите ни в одном клане.")
+        return
+
+    clans = load_clans()
+    clan = next((c for c in clans if c["id"] == clan_id), None)
+    if not clan:
+        set_user_clan_id(user.id, None)
+        await update.message.reply_text("ℹ️ Клан не найден в базе, вы были отвязаны от него.")
+        return
+
+    if user.id in clan.get("members", []):
+        clan["members"].remove(user.id)
+    set_user_clan_id(user.id, None)
+
+    disbanded = False
+    clan_name = clan["name"]
+    if clan["owner"] == user.id:
+        if clan["members"]:
+            clan["owner"] = clan["members"][0]
+        else:
+            clans.remove(clan)
+            disbanded = True
+    if not disbanded:
+        clans = [c if c["id"] != clan_id else clan for c in clans]
+    save_clans(clans)
+
+    if disbanded:
+        await update.message.reply_text(f"✅ Вы покинули клан «{clan_name}». Клан расформирован (не осталось участников).")
+    else:
+        await update.message.reply_text(f"✅ Вы покинули клан «{clan_name}».")
+
+async def clan_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    clan_id = get_user_clan_id(user.id)
+    if not clan_id:
+        await update.message.reply_text("❌ Вы не состоите ни в одном клане. Создайте клан: /create_clan <название>")
+        return
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /clan_deposit <сумма>")
+        return
+    try:
+        amount = int(context.args[0])
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите положительное число монет.")
+        return
+
+    balance = get_coins(user.id)
+    if balance < amount:
+        await update.message.reply_text("❌ Недостаточно монет на балансе!")
+        return
+
+    clans = load_clans()
+    clan = next((c for c in clans if c["id"] == clan_id), None)
+    if not clan:
+        await update.message.reply_text("❌ Клан не найден.")
+        return
+
+    update_coins(user.id, -amount)
+    clan["treasury"] = clan.get("treasury", 0) + amount
+    save_clans(clans)
+
+    rank = get_clan_rank(clan["id"])
+    bonus = CLAN_BUFF_TIERS.get(rank, 0)
+    text = (
+        f"✅ Вы внесли {_fmt_coins(amount)} монет в казну клана «{clan['name']}».\n"
+        f"🏦 Казна клана: {_fmt_coins(clan['treasury'])} монет."
+    )
+    if bonus:
+        text += f"\n{_clan_rank_badge(rank)} Клан в топ-3! Участники получают +{bonus}% к монетам."
+    await update.message.reply_text(text)
+
+def _clan_rank_badge(rank) -> str:
+    if rank == 1:
+        return "🥇"
+    if rank == 2:
+        return "🥈"
+    if rank == 3:
+        return "🥉"
+    if rank:
+        return f"#{rank}"
+    return "—"
+
+def _fmt_coins(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ")
+
+async def clan_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    clan_id = get_user_clan_id(user.id)
+    if context.args:
+        try:
+            clan_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Укажите числовой ID клана.")
+            return
+
+    if not clan_id:
+        await update.message.reply_text(
+            "❌ Вы не состоите ни в одном клане.\n"
+            "Создайте свой: /create_clan <название>\n"
+            "Или вступите в существующий: /join_clan <ID> (список: /clans)"
+        )
+        return
+
+    clan = get_clan_by_id(clan_id)
+    if not clan:
+        await update.message.reply_text("❌ Клан не найден.")
+        return
+
+    rank = get_clan_rank(clan["id"])
+    bonus = CLAN_BUFF_TIERS.get(rank, 0)
+    badge = _clan_rank_badge(rank)
+    owner_name = await _get_display_name(context, clan["owner"])
+    members = clan.get("members", [])
+
+    lines = [
+        f"🏰 <b>{html.escape(clan['name'])}</b>",
+        f"🆔 ID клана: {clan['id']}",
+        f"👑 Владелец: {owner_name}",
+        f"👥 Участников: {len(members)}",
+        f"🏦 Казна: {_fmt_coins(clan.get('treasury', 0))} монет",
+        f"📊 Место в рейтинге: {badge}" + (f" (из {len(get_ranked_clans())} в зачёте)" if rank else " (нет в зачёте — казна пуста)"),
+    ]
+    if bonus:
+        lines.append(f"\n🌟 Активный бафф клана: <b>+{bonus}%</b> к получаемым монетам для всех участников!")
+    else:
+        lines.append(f"\nℹ️ Бафф получают кланы в топ-3 по казне: {', '.join(f'{_clan_rank_badge(r)} +{p}%' for r, p in sorted(CLAN_BUFF_TIERS.items()))}.")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def clans_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clans = load_clans()
+    if not clans:
+        await update.message.reply_text("ℹ️ Пока не создано ни одного клана. Создайте первый: /create_clan <название>")
+        return
+
+    sorted_clans = sorted(clans, key=lambda c: c.get("treasury", 0), reverse=True)
+    lines = ["🏆 <b>Рейтинг кланов по казне</b>\n"]
+    for i, c in enumerate(sorted_clans[:10], 1):
+        eligible = c.get("treasury", 0) > 0 and c.get("members")
+        badge = _clan_rank_badge(i) if eligible else "•"
+        bonus = CLAN_BUFF_TIERS.get(i, 0) if eligible else 0
+        bonus_text = f" (+{bonus}%)" if bonus else ""
+        lines.append(
+            f"{badge} «{html.escape(c['name'])}»{bonus_text} — 🏦 {_fmt_coins(c.get('treasury', 0))} монет, 👥 {len(c.get('members', []))} чел. (ID: {c['id']})"
+        )
+    tiers_text = ", ".join(f"{_clan_rank_badge(r)} +{p}%" for r, p in sorted(CLAN_BUFF_TIERS.items()))
+    lines.append(f"\n🌟 Топ-3 клана по казне получают бафф к получаемым монетам: {tiers_text}.")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 # ============================ MAIN ============================
 def main() -> None:
@@ -2792,9 +3299,9 @@ def main() -> None:
         ])
 
     # Создаём файлы, если их нет
-    for f in [USERS_FILE, BLACKLIST_FILE, MODERATORS_FILE, COINS_FILE, SHOP_FILE, PROMOCODES_FILE, EVENTS_FILE, BETS_FILE]:
+    for f in [USERS_FILE, BLACKLIST_FILE, MODERATORS_FILE, COINS_FILE, SHOP_FILE, PROMOCODES_FILE, EVENTS_FILE, BETS_FILE, CLANS_FILE]:
         if not os.path.exists(f):
-            if f in [BLACKLIST_FILE, MODERATORS_FILE, SHOP_FILE, EVENTS_FILE, BETS_FILE]:
+            if f in [BLACKLIST_FILE, MODERATORS_FILE, SHOP_FILE, EVENTS_FILE, BETS_FILE, CLANS_FILE]:
                 save_data(f, [])
             else:
                 save_data(f, {})
@@ -2946,6 +3453,12 @@ def main() -> None:
     application.add_handler(CommandHandler("my_bets", my_bets))
     application.add_handler(CommandHandler("find_match", find_match))
     application.add_handler(CommandHandler("rating", rating_profile))
+    application.add_handler(CommandHandler("create_clan", create_clan))
+    application.add_handler(CommandHandler("join_clan", join_clan))
+    application.add_handler(CommandHandler("leave_clan", leave_clan))
+    application.add_handler(CommandHandler("clan_deposit", clan_deposit))
+    application.add_handler(CommandHandler("clan_info", clan_info))
+    application.add_handler(CommandHandler("clans", clans_leaderboard))
 
     # CallbackQueryHandler'ы
     application.add_handler(CallbackQueryHandler(admin_shop_type, pattern=r"^(reset|pack)"))
