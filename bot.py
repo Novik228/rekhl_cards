@@ -7,6 +7,15 @@ import asyncio
 from datetime import datetime, timedelta
 import logging
 from collections import Counter
+import io
+
+# Pillow нужен для картинки рейтингового состава (/rating).
+# Если не установлен (pip install Pillow) — бот работает, состав показывается текстом.
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -361,6 +370,98 @@ def set_rating_elo(user_id: int, elo: int):
     user_data["rating_elo"] = elo
     users[str(user_id)] = user_data
     save_data(USERS_FILE, users)
+
+# ============================ КРАСИВЫЕ РАМКИ КАРТОЧЕК (Pillow) ============================
+FRAMED_CARDS_DIR = "cards_images_framed"
+
+# Цвета рамок по редкости: (основной, светлый акцент)
+RARITY_FRAME_COLORS = {
+    "Обычная": ((150, 155, 165), (205, 210, 220)),
+    "Редкая": ((60, 150, 255), (150, 205, 255)),
+    "Эпическая": ((165, 85, 255), (215, 165, 255)),
+    "Легендарная": ((255, 190, 30), (255, 235, 140)),
+    "Блещет умом": ((0, 210, 190), (150, 255, 240)),
+    "Эксклюзивная": ((255, 55, 90), (255, 155, 175)),
+}
+
+def get_framed_card_photo(card: dict):
+    """Картинка карточки с рамкой по редкости (файл) или None.
+
+    Результат кэшируется на диск: рамка рисуется ОДИН раз, дальше отдаётся
+    готовый файл — никакой нагрузки при большом потоке игроков.
+    None -> отправляем оригинал, как раньше (нет Pillow / ошибка)."""
+    if not PIL_AVAILABLE:
+        return None
+    src_path = os.path.join(CARDS_IMAGE_DIR, card.get("image", ""))
+    if not os.path.exists(src_path):
+        return None
+    try:
+        os.makedirs(FRAMED_CARDS_DIR, exist_ok=True)
+        # Ключ кэша: id + имя + редкость + время изменения исходника.
+        # Если админ заменит фото/название/редкость — рамка перерисуется сама.
+        mtime = int(os.path.getmtime(src_path))
+        cache_key = f"{card['id']}_{abs(hash((card.get('name'), card['rarity'], mtime))) % 10**10}.png"
+        cache_path = os.path.join(FRAMED_CARDS_DIR, cache_key)
+        if os.path.exists(cache_path):
+            return open(cache_path, "rb")
+
+        main, light = RARITY_FRAME_COLORS.get(card["rarity"], RARITY_FRAME_COLORS["Обычная"])
+        img = Image.open(src_path).convert("RGB")
+        target_w = 512
+        target_h = max(1, int(img.height * target_w / max(1, img.width)))
+        img = img.resize((target_w, target_h))
+
+        border = 26
+        panel = 118
+        width = target_w + border * 2
+        height = target_h + border * 2 + panel
+        canvas = Image.new("RGB", (width, height), (16, 20, 30))
+        draw = ImageDraw.Draw(canvas)
+
+        legendary = is_legendary_or_higher(card["rarity"])
+        # "Свечение" для легендарных и выше: несколько рамок от тёмного к светлому
+        if legendary:
+            glow = (tuple(c // 3 for c in main), tuple(c // 2 for c in main), main)
+            for i, col in enumerate(glow):
+                draw.rectangle([i * 3, i * 3, width - 1 - i * 3, height - 1 - i * 3], outline=col, width=3)
+        # Основная рамка вокруг изображения + светлая линия внутри
+        draw.rectangle([border - 8, border - 8, width - border + 8, target_h + border + 8], outline=main, width=6)
+        draw.rectangle([border - 2, border - 2, width - border + 2, target_h + border + 2], outline=light, width=2)
+        canvas.paste(img, (border, border))
+        # Уголки-акценты
+        cl = 34
+        corners = (
+            (border - 8, border - 8, 1, 1),
+            (width - border + 8, border - 8, -1, 1),
+            (border - 8, target_h + border + 8, 1, -1),
+            (width - border + 8, target_h + border + 8, -1, -1),
+        )
+        for cx, cy, dx, dy in corners:
+            draw.line([cx, cy, cx + dx * cl, cy], fill=light, width=6)
+            draw.line([cx, cy, cx, cy + dy * cl], fill=light, width=6)
+        # Нижняя панель: название + редкость
+        name = str(card.get("name", "?"))
+        if len(name) > 24:
+            name = name[:23] + "..."
+        rarity_text = str(card["rarity"]).upper()
+        if legendary:
+            rarity_text = f"★ {rarity_text} ★"
+        font_name = _load_team_font(40)
+        font_rarity = _load_team_font(26)
+        try:
+            name_w = draw.textlength(name, font=font_name)
+            rar_w = draw.textlength(rarity_text, font=font_rarity)
+        except Exception:
+            name_w = rar_w = 0
+        y0 = target_h + border * 2
+        draw.text((max(0, (width - name_w) / 2), y0 + 10), name, font=font_name, fill=(240, 243, 250))
+        draw.text((max(0, (width - rar_w) / 2), y0 + 62), rarity_text, font=font_rarity, fill=main)
+
+        canvas.save(cache_path, format="PNG")
+        return open(cache_path, "rb")
+    except Exception as e:
+        logger.warning(f"Не удалось нарисовать рамку карточки: {e}")
+        return None
 
 def get_rating_team(user_id: int):
     users = load_data(USERS_FILE, {})
@@ -950,7 +1051,8 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
     image_path = os.path.join(CARDS_IMAGE_DIR, card["image"])
     if os.path.exists(image_path):
-        await update.message.reply_photo(photo=open(image_path, "rb"), caption=caption)
+        photo = get_framed_card_photo(card) or open(image_path, "rb")
+        await update.message.reply_photo(photo=photo, caption=caption)
     else:
         logger.warning(f"Изображение карточки не найдено: {image_path}")
         await update.message.reply_text(caption)
@@ -1020,7 +1122,8 @@ async def card_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caption += f"📊 <b>В вашей коллекции</b>: {card_count} шт.\n"
     image_path = os.path.join(CARDS_IMAGE_DIR, card["image"])
     if os.path.exists(image_path):
-        await update.message.reply_photo(photo=open(image_path, "rb"), caption=caption, parse_mode="HTML")
+        photo = get_framed_card_photo(card) or open(image_path, "rb")
+        await update.message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
     else:
         logger.warning(f"Изображение карточки не найдено: {image_path}")
         await update.message.reply_text(caption, parse_mode="HTML")
@@ -1246,17 +1349,19 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.delete_message(chat_id=message.chat_id, message_id=warn_msg.message_id)
 
 # ============================ КЛАВИАТУРА ============================
+KEYBOARD_LAYOUT = [
+    ["🎴 Получить карту", "📚 Коллекция", "🎁 Награда"],
+    ["🛒 Магазин", "🏪 Маркет", "💰 Баланс"],
+    ["👤 Профиль", "🏆 Топ", "🃏 Бафф"],
+    ["📊 Мои ставки", "🏰 Клан", "⚔️ Рейтинг"],
+    ["❌ Скрыть клавиатуру"],
+]
+ALL_KEYBOARD_BUTTONS = [btn for row in KEYBOARD_LAYOUT for btn in row]
+
 def get_main_keyboard(selective: bool = False) -> ReplyKeyboardMarkup:
-    """Основная reply-клавиатура с популярными командами."""
-    keyboard = [
-        ["/get_card", "/my_cards", "/daily"],
-        ["/shop", "/market", "/balance"],
-        ["/profile", "/leaderboard", "/buff"],
-        ["/my_bets", "/clan_info", "/clans"],
-        ["/hide"],
-    ]
+    """Основная reply-клавиатура: красивые кнопки вместо голых команд."""
     return ReplyKeyboardMarkup(
-        keyboard,
+        KEYBOARD_LAYOUT,
         resize_keyboard=True,
         selective=selective,
     )
@@ -1293,6 +1398,30 @@ async def hide_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=ReplyKeyboardRemove(selective=True),
             reply_to_message_id=update.message.message_id,
         )
+
+async def keyboard_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажатия красивых кнопок клавиатуры -> вызов соответствующей команды."""
+    if not update.message or not update.message.text:
+        return
+    mapping = {
+        "🎴 Получить карту": get_card,
+        "📚 Коллекция": show_collection,
+        "🎁 Награда": daily_claim,
+        "🛒 Магазин": show_shop,
+        "🏪 Маркет": show_market,
+        "💰 Баланс": show_balance,
+        "👤 Профиль": profile,
+        "🏆 Топ": show_leaderboard,
+        "🃏 Бафф": buff_info,
+        "📊 Мои ставки": my_bets,
+        "🏰 Клан": clan_info,
+        "⚔️ Рейтинг": rating_profile,
+        "❌ Скрыть клавиатуру": hide_keyboard,
+    }
+    handler = mapping.get(update.message.text.strip())
+    if handler:
+        context.args = []
+        await handler(update, context)
 
 # ============================ АДМИН-КОМАНДЫ ============================
 async def admin_addcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1417,6 +1546,14 @@ async def admin_deletecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             os.remove(image_path)
         except Exception as e:
             logger.error(f"Ошибка удаления изображения: {e}")
+    # Чистим кэш красивых рамок этой карточки
+    try:
+        if os.path.isdir(FRAMED_CARDS_DIR):
+            for fname in os.listdir(FRAMED_CARDS_DIR):
+                if fname.startswith(f"{card_id}_"):
+                    os.remove(os.path.join(FRAMED_CARDS_DIR, fname))
+    except Exception as e:
+        logger.error(f"Ошибка очистки кэша рамок: {e}")
 
     # Удаляем карточку из базы
     del cards[card_index]
@@ -2458,6 +2595,11 @@ SLOT_SYMBOLS = ["🍏", "🍌", "🍒", "🍋", "🍇", "⚫️"]
 SLOT_WEIGHTS = [6, 5, 4, 3, 2, 1]
 SLOT_PAYOUTS = {"🍏": 3, "🍌": 4, "🍒": 5, "🍋": 8, "🍇": 15, "⚫️": 75}
 
+# Анти-спам для слотов: минимальный интервал между спинами (секунды).
+# Храним в памяти — никаких лишних чтений/записей файлов.
+SLOTS_SPIN_COOLDOWN = 3
+_SLOTS_LAST_SPIN = {}
+
 async def slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if is_banned(user.id):
@@ -2466,6 +2608,12 @@ async def slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_subscribed(user.id, context):
         await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
         return
+    # Анти-спам: не чаще одного спина в SLOTS_SPIN_COOLDOWN секунд.
+    # Спам-запросы игнорируем молча — ноль обращений к Telegram API.
+    now = time.time()
+    if now - _SLOTS_LAST_SPIN.get(user.id, 0) < SLOTS_SPIN_COOLDOWN:
+        return
+    _SLOTS_LAST_SPIN[user.id] = now
     if not context.args:
         await update.message.reply_text(
             "ℹ️ Использование: /slots <сумма>\n\n"
@@ -2512,24 +2660,15 @@ async def slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{result_line}\n"
         f"💰 Баланс: {new_balance} монет"
     )
-    # Небольшая анимация: барабаны открываются по одному
+    # Облегчённая анимация: 1 сообщение + 1 правка вместо четырёх запросов к API.
+    # Нагрузка на бота при спаме слотами падает вдвое.
     spin_msg = None
     try:
         spin_msg = await update.message.reply_text(
-            "🎰 <b>Слоты</b>\n\n[ ❓ | ❓ | ❓ ]\n\nКрутим барабаны...",
-            parse_mode="HTML"
-        )
-        await asyncio.sleep(0.8)
-        await spin_msg.edit_text(
             f"🎰 <b>Слоты</b>\n\n[ {reels[0]} | ❓ | ❓ ]\n\nКрутим барабаны...",
             parse_mode="HTML"
         )
-        await asyncio.sleep(0.8)
-        await spin_msg.edit_text(
-            f"🎰 <b>Слоты</b>\n\n[ {reels[0]} | {reels[1]} | ❓ ]\n\nКрутим барабаны...",
-            parse_mode="HTML"
-        )
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(1.0)
         await spin_msg.edit_text(final_text, parse_mode="HTML")
     except Exception:
         # Анимация не критична: если что-то пошло не так — просто показываем результат
@@ -4567,6 +4706,83 @@ async def cancel_rating_team(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("rating_gk", None)
     return ConversationHandler.END
 
+def _load_team_font(size: int):
+    """Ищем шрифт с поддержкой кириллицы (Linux/Windows), иначе дефолтный."""
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "DejaVuSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "arialbd.ttf",
+        "arial.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except Exception:
+        return ImageFont.load_default()
+
+def build_rating_team_image(user_id: int):
+    """Собирает красивую картинку рейтингового состава (PNG в памяти).
+
+    Возвращает BytesIO или None (нет Pillow / нет состава) — тогда показываем текст."""
+    if not PIL_AVAILABLE:
+        return None
+    team = get_rating_team(user_id)
+    if not team:
+        return None
+    all_cards = load_data(CARDS_FILE, [])
+    card_map = {c["id"]: c for c in all_cards}
+    members = [("ВРАТАРЬ", card_map.get(team["gk"]))]
+    for fid in team["field"]:
+        members.append(("ПОЛЕВОЙ", card_map.get(fid)))
+
+    CARD_W, CARD_H, GAP, PAD, TOP = 220, 300, 24, 36, 120
+    width = PAD * 2 + len(members) * CARD_W + (len(members) - 1) * GAP
+    height = TOP + CARD_H + 116
+    img = Image.new("RGB", (width, height), (13, 22, 38))
+    draw = ImageDraw.Draw(img)
+    font_title = _load_team_font(44)
+    font_role = _load_team_font(22)
+    font_name = _load_team_font(24)
+    font_small = _load_team_font(20)
+
+    elo = get_rating_elo(user_id)
+    strength = int(_team_strength(team, card_map))
+    draw.text((PAD, 28), "РЕЙТИНГОВЫЙ СОСТАВ", font=font_title, fill=(255, 214, 90))
+    draw.text((PAD, 82), f"Рейтинг: {elo}   Сила состава: {strength}", font=font_small, fill=(150, 200, 255))
+
+    for i, (role, card) in enumerate(members):
+        x = PAD + i * (CARD_W + GAP)
+        border = (255, 200, 60) if role == "ВРАТАРЬ" else (90, 150, 255)
+        draw.rectangle([x - 4, TOP - 4, x + CARD_W + 4, TOP + CARD_H + 4], outline=border, width=4)
+        card_img = None
+        if card:
+            path = os.path.join(CARDS_IMAGE_DIR, card.get("image", ""))
+            if os.path.exists(path):
+                try:
+                    card_img = Image.open(path).convert("RGB").resize((CARD_W, CARD_H))
+                except Exception:
+                    card_img = None
+        if card_img:
+            img.paste(card_img, (x, TOP))
+        else:
+            draw.rectangle([x, TOP, x + CARD_W, TOP + CARD_H], fill=(30, 45, 70))
+            draw.text((x + 48, TOP + CARD_H // 2 - 12), "НЕТ ФОТО", font=font_role, fill=(120, 140, 170))
+        draw.text((x, TOP + CARD_H + 12), role, font=font_role, fill=border)
+        name = (card.get("name", "?") if card else "?")[:18]
+        draw.text((x, TOP + CARD_H + 42), name, font=font_name, fill=(235, 240, 250))
+        power = get_card_power(card or {})
+        draw.text((x, TOP + CARD_H + 74), f"Сила: {power}", font=font_small, fill=(150, 200, 255))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
 async def rating_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     elo = get_rating_elo(user.id)
@@ -4583,7 +4799,17 @@ async def rating_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for fid in team["field"]:
         fc = card_map.get(fid)
         lines.append(f"⚔️ Полевой: {fc['name'] if fc else fid}")
-    await update.message.reply_text(f"⭐ Ваш рейтинг: {elo}\n\n" + "\n".join(lines))
+    caption = f"⭐ Ваш рейтинг: {elo}\n\n" + "\n".join(lines)
+    # Пробуем отправить красивую картинку состава (нужен Pillow: pip install Pillow)
+    photo = None
+    try:
+        photo = build_rating_team_image(user.id)
+    except Exception as e:
+        logger.warning(f"Не удалось построить картинку состава: {e}")
+    if photo:
+        await update.message.reply_photo(photo=photo, caption=caption)
+    else:
+        await update.message.reply_text(caption)
 
 def _team_strength(team: dict, card_map: dict) -> float:
     gk_power = get_card_power(card_map.get(team["gk"], {}))
@@ -5499,6 +5725,9 @@ def main() -> None:
 
     # Обработка обновлений голосований (ручная/автоматическая остановка)
     application.add_handler(PollHandler(poll_update_handler))
+
+    # Кнопки красивой клавиатуры (точное совпадение текста кнопки)
+    application.add_handler(MessageHandler(filters.Text(ALL_KEYBOARD_BUTTONS), keyboard_button_handler))
 
     # MessageHandler для текстового ввода (ставки, обмен, события)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input_handler))
