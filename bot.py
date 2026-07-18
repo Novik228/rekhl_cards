@@ -6,13 +6,16 @@ import html
 import asyncio
 from datetime import datetime, timedelta
 import logging
+from collections import Counter
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    CallbackContext,
     CommandHandler,
     ContextTypes,
     CallbackQueryHandler,
     MessageHandler,
+    PollHandler,
     filters,
     ConversationHandler
 )
@@ -40,24 +43,70 @@ PROMOCODES_FILE = "promocodes.json"
 EVENTS_FILE = "events.json"
 BETS_FILE = "bets.json"
 CLANS_FILE = "clans.json"
+MARKET_FILE = "market.json"
+TRADES_FILE = "trades.json"
+SEASON_FILE = "season.json"
+CHANNEL_EVENTS_FILE = "channel_events.json"
+DROP_BOOSTS_FILE = "drop_boosts.json"
+ISSUED_PROMO_CODES_FILE = "issued_promo_ids.json"
 CARDS_IMAGE_DIR = "cards_images"
 
 # ============================ СИСТЕМА КЛАНОВ ============================
 CLAN_CREATE_COST = 1000          # стоимость создания клана
 CLAN_BUFF_TIERS = {1: 8, 2: 5, 3: 3}  # % бонуса к монетам по месту клана в рейтинге казны (1 - самый большой)
+CLAN_UPGRADE_COSTS = {1: 500, 2: 1000, 3: 2000, 4: 3500, 5: 5000}
+CLAN_UPGRADE_BONUS_PER_LEVEL = 2   # +2% к клан-баффу за каждый уровень прокачки
+
+# ============================ РЕДКОСТИ: ДЕФОЛТНЫЕ ШАНСЫ ============================
+DEFAULT_RARITY_CHANCES = {
+    "Легендарная": 0.05,
+    "Блещет умом": 0.07,
+    "Эпическая": 0.15,
+    "Редкая": 0.30,
+    "Обычная": 0.50,
+}
+
+# ============================ МАРКЕТ ============================
+MARKET_MIN_PRICES = {
+    "Легендарная": 500,
+    "Эксклюзивная": 1000,
+}
+
+# ============================ РАБОТА КАРТОЧКАМИ ============================
+WORK_COOLDOWN_SECONDS = 2 * 3600
+WORK_DURATION_SECONDS = 3600
+WORK_REWARDS = {
+    "Обычная": (20, 40),
+    "Редкая": (40, 70),
+    "Эпическая": (70, 100),
+    "Блещет умом": (100, 150),
+    "Легендарная": (150, 250),
+    "Эксклюзивная": (250, 400),
+}
+
+DEFAULT_RATING_ELO = 1000
 
 # ============================ СОСТОЯНИЯ ============================
-ADMIN_CARD_NAME, ADMIN_CARD_RARITY, ADMIN_CARD_DESCRIPTION, ADMIN_CARD_IMAGE = range(4)
-ADMIN_SHOP_NAME, ADMIN_SHOP_TYPE, ADMIN_SHOP_PRICE, ADMIN_SHOP_CARDS, ADMIN_SHOP_DURATION = range(5)
-ADMIN_RARITY_NAME, ADMIN_RARITY_EMOJI, ADMIN_RARITY_DROPPABLE = range(3)
-EDIT_CARD_SELECT, EDIT_CARD_FIELD, EDIT_CARD_VALUE = range(3)
-CRAFT_SELECT_CARDS = range(1)
+ADMIN_CARD_NAME, ADMIN_CARD_RARITY, ADMIN_CARD_DESCRIPTION, ADMIN_CARD_IMAGE = range(60, 64)
+ADMIN_SHOP_NAME, ADMIN_SHOP_TYPE, ADMIN_SHOP_PRICE, ADMIN_SHOP_CARDS, ADMIN_SHOP_DURATION = range(70, 75)
+ADMIN_RARITY_NAME, ADMIN_RARITY_EMOJI, ADMIN_RARITY_DROPPABLE, ADMIN_RARITY_CHANCE = range(80, 84)
+ADMIN_EDIT_RARITY_NAME, ADMIN_EDIT_RARITY_EMOJI, ADMIN_EDIT_RARITY_DROPPABLE, ADMIN_EDIT_RARITY_CHANCE = range(90, 94)
+EDIT_CARD_SELECT, EDIT_CARD_FIELD, EDIT_CARD_VALUE = range(100, 103)
+CRAFT_SELECT_CARDS = 20
 
 # Промокоды
-PROMO_NAME, PROMO_TYPE, PROMO_VALUE, PROMO_USES, PROMO_DURATION = range(5)
+PROMO_NAME, PROMO_TYPE, PROMO_VALUE, PROMO_USES, PROMO_DURATION = range(40, 45)
 
 # Рейтинговый режим
-RATING_TEAM_GK, RATING_TEAM_FIELD = range(2)
+RATING_TEAM_GK, RATING_TEAM_FIELD = 30, 31
+
+# Сезоны рейтинга
+SEASON_NUMBER, SEASON_PRIZE_1, SEASON_PRIZE_2, SEASON_PRIZE_3 = range(50, 54)
+
+# События канала (админ)
+EVENT_BOOST_RARITY, EVENT_BOOST_MULT, EVENT_BOOST_DURATION = range(3)
+EVENT_SCHED_DELAY, EVENT_SCHED_RARITY, EVENT_SCHED_MULT, EVENT_SCHED_DURATION = range(3, 7)
+EVENT_POLL_TYPE, EVENT_POLL_VALUE, EVENT_POLL_DURATION, EVENT_PROMO_DURATION = range(7, 11)
 
 # ============================ ЛОГГИРОВАНИЕ ============================
 logging.basicConfig(
@@ -79,6 +128,17 @@ def load_data(filename, default=None):
 def save_data(filename, data):
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def _next_promo_id(prefix: str) -> int:
+    issued = load_data(ISSUED_PROMO_CODES_FILE, {})
+    ids = issued.get(prefix, [])
+    new_id = 1
+    while new_id in ids:
+        new_id += 1
+    ids.append(new_id)
+    issued[prefix] = ids
+    save_data(ISSUED_PROMO_CODES_FILE, issued)
+    return new_id
 
 def is_banned(user_id: int) -> bool:
     blacklist = load_data(BLACKLIST_FILE, [])
@@ -141,8 +201,9 @@ def get_rarity_emoji(rarity_name: str) -> str:
 async def show_collection_with_ids(user_id: int) -> str:
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user_id), {})
-    user_cards = user_data.get("cards", [])
-    if not user_cards:
+    user_cards = get_available_card_ids(user_id)
+    locked = get_locked_card_ids(user_id)
+    if not user_cards and not locked:
         return "📭 Ваша коллекция пуста!"
     all_cards = load_data(CARDS_FILE, [])
     rarities = load_data(RARITIES_FILE, [])
@@ -166,13 +227,28 @@ async def show_collection_with_ids(user_id: int) -> str:
         count_in_rarity = sum(count for _, count in cards_in_rarity)
         total_count += count_in_rarity
         emoji = get_rarity_emoji(rarity)
-        message += f"{emoji} <b>{rarity}</b> ({count_in_rarity}):\n"
+        message += f"{emoji} <b>{html.escape(rarity)}</b> ({count_in_rarity}):\n"
         sorted_cards = sorted(cards_in_rarity, key=lambda x: x[0]['id'])
         for card, count in sorted_cards:
             count_text = f" (x{count})" if count > 1 else ""
             message += f"   • {html.escape(card['name'])}{count_text} [ID: {card['id']}]\n"
         message += "\n"
-    message += f"📚 <b>Всего карточек: {total_count}</b>"
+    if locked:
+        all_cards = load_data(CARDS_FILE, [])
+        card_map = {c["id"]: c for c in all_cards}
+        locked_counts = Counter(locked)
+        message += f"🔒 <b>Недоступны</b> ({len(locked)} — на маркете или в работе):\n"
+        for cid in sorted(locked_counts):
+            cname = card_map.get(cid, {}).get("name", f"ID {cid}")
+            count = locked_counts[cid]
+            count_text = f" (x{count})" if count > 1 else ""
+            message += f"   • {html.escape(cname)}{count_text} [ID: {cid}]\n"
+        message += "\n"
+    # Всего = карточки на руках + копии на маркете/в работе (они удалены из cards).
+    total_all = len(user_data.get("cards", [])) + len(locked)
+    message += f"📚 <b>Доступно карточек: {total_count}</b>"
+    if locked:
+        message += f" (всего в коллекции: {total_all})"
     return message
 
 def get_coins(user_id: int) -> int:
@@ -386,13 +462,13 @@ def get_top_clan():
     return ranked[0] if ranked else None
 
 def get_clan_coin_multiplier(user_id: int) -> float:
-    """Небольшой бафф к получаемым монетам для участников топ-3 кланов по казне (топ-1 - самый большой)."""
+    """Небольшой бафф к получаемым монетам для участников топ-3 кланов по казне (+ прокачка из казны)."""
     clan_id = get_user_clan_id(user_id)
     if clan_id is None:
         return 1.0
-    rank = get_clan_rank(clan_id)
-    if rank in CLAN_BUFF_TIERS:
-        return 1.0 + CLAN_BUFF_TIERS[rank] / 100.0
+    bonus = get_clan_buff_bonus_percent(clan_id)
+    if bonus > 0:
+        return 1.0 + bonus / 100.0
     return 1.0
 
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОФИЛЯ ========================
@@ -406,6 +482,141 @@ def add_seen_card(user_id: int, card_id: int):
         users[str(user_id)] = user_data
         save_data(USERS_FILE, users)
 
+# ============================ КАРТОЧКИ: ДОСТУПНОСТЬ И РЕДКОСТИ ============================
+def is_default_rarity(rarity_name: str) -> bool:
+    return rarity_name in DEFAULT_RARITY_CHANCES
+
+def get_rarity_drop_chance(rarity_name: str) -> float:
+    if rarity_name in DEFAULT_RARITY_CHANCES:
+        return DEFAULT_RARITY_CHANCES[rarity_name]
+    rarities = load_data(RARITIES_FILE, [])
+    for rarity in rarities:
+        if rarity["name"] == rarity_name:
+            return rarity.get("chance", 0.01)
+    return 0.0
+
+def get_all_rarity_chances_display() -> list:
+    """Список (name, emoji, chance, droppable, is_default) для отображения админу."""
+    rarities = load_data(RARITIES_FILE, [])
+    result = []
+    seen = set()
+    for rarity in rarities:
+        name = rarity["name"]
+        seen.add(name)
+        result.append({
+            "name": name,
+            "emoji": rarity.get("emoji", "🃏"),
+            "chance": get_rarity_drop_chance(name),
+            "droppable": rarity.get("droppable", True),
+            "is_default": is_default_rarity(name),
+        })
+    for name, chance in DEFAULT_RARITY_CHANCES.items():
+        if name not in seen:
+            result.append({
+                "name": name,
+                "emoji": get_rarity_emoji(name),
+                "chance": chance,
+                "droppable": name != "Эксклюзивная",
+                "is_default": True,
+            })
+    return result
+
+def get_active_drop_boosts() -> list:
+    boosts = load_data(DROP_BOOSTS_FILE, [])
+    now = time.time()
+    active = [b for b in boosts if b.get("until", 0) > now]
+    if len(active) != len(boosts):
+        save_data(DROP_BOOSTS_FILE, active)
+    return active
+
+def get_drop_weights() -> dict:
+    rarities = load_data(RARITIES_FILE, [])
+    droppable = [r for r in rarities if r.get("droppable", True)]
+    weights = {}
+    for rarity in droppable:
+        name = rarity["name"]
+        weights[name] = get_rarity_drop_chance(name)
+        if weights[name] <= 0:
+            weights[name] = 0.01
+    if not weights:
+        weights = dict(DEFAULT_RARITY_CHANCES)
+    for boost in get_active_drop_boosts():
+        rarity = boost.get("rarity")
+        if rarity in weights:
+            weights[rarity] *= boost.get("multiplier", 2.0)
+    return weights
+
+def pick_rarity_for_drop() -> str:
+    weights = get_drop_weights()
+    if not weights:
+        return "Обычная"
+    names = list(weights.keys())
+    vals = [weights[n] for n in names]
+    return random.choices(names, weights=vals, k=1)[0]
+
+def get_user_listed_card_ids(user_id: int) -> list:
+    market = load_data(MARKET_FILE, [])
+    return [item["card_id"] for item in market if item["seller_id"] == user_id]
+
+def get_user_working_card(user_id: int):
+    users = load_data(USERS_FILE, {})
+    work = users.get(str(user_id), {}).get("working_card")
+    if work and time.time() < work.get("finish_at", 0):
+        return work
+    return None
+
+def get_locked_card_ids(user_id: int) -> list:
+    locked = list(get_user_listed_card_ids(user_id))
+    work = get_user_working_card(user_id)
+    if work:
+        locked.append(work["card_id"])
+    return locked
+
+def get_available_card_ids(user_id: int) -> list:
+    users = load_data(USERS_FILE, {})
+    # Копии на маркете и в работе уже физически удалены из cards
+    # (см. sell_card/work_command -> remove_one_card), поэтому всё, что осталось
+    # в cards, доступно. Повторное вычитание locked прятало оставшиеся
+    # дубликаты выставленной карточки.
+    return list(users.get(str(user_id), {}).get("cards", []))
+
+def remove_one_card(user_id: int, card_id: int) -> bool:
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    cards = user_data.get("cards", [])
+    if card_id not in cards:
+        return False
+    cards.remove(card_id)
+    user_data["cards"] = cards
+    users[str(user_id)] = user_data
+    save_data(USERS_FILE, users)
+    return True
+
+def add_one_card(user_id: int, card_id: int) -> None:
+    users = load_data(USERS_FILE, {})
+    user_data = users.setdefault(str(user_id), {"cards": [], "last_drop": 0})
+    if "cards" not in user_data:
+        user_data["cards"] = []
+    user_data["cards"].append(card_id)
+    users[str(user_id)] = user_data
+    save_data(USERS_FILE, users)
+    add_seen_card(user_id, card_id)
+
+async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str, parse_mode: str = "HTML") -> None:
+    try:
+        await context.bot.send_message(CHANNEL_ID, text, parse_mode=parse_mode)
+    except Exception as e:
+        logger.error(f"Не удалось отправить сообщение в канал: {e}")
+
+def get_clan_buff_bonus_percent(clan_id) -> int:
+    clan = get_clan_by_id(clan_id)
+    if not clan:
+        return 0
+    rank = get_clan_rank(clan_id)
+    base = CLAN_BUFF_TIERS.get(rank, 0)
+    upgrade = clan.get("buff_upgrade_level", 0) * CLAN_UPGRADE_BONUS_PER_LEVEL
+    return base + upgrade
+
 # ============================ ОСНОВНЫЕ КОМАНДЫ ============================
 
 USER_COMMANDS_TEXT = (
@@ -413,7 +624,11 @@ USER_COMMANDS_TEXT = (
     "/get_card - получить карточку\n"
     "/my_cards - моя коллекция\n"
     "/shop - магазин\n"
-    "/givecard <user_id> <card_id> - передать карточку\n"
+    "/trade <user_id> <card_id> - предложить обмен карточкой\n"
+    "/market - маркет карточек\n"
+    "/sell <card_id> <цена> - выставить карточку на продажу\n"
+    "/my_listings - мои объявления на маркете\n"
+    "/work <card_id> - отправить карточку работать (раз в 2 часа)\n"
     "/balance - баланс монет\n"
     "/card_info <card_id> - информация о карточке\n"
     "/craft - улучшить карточки\n"
@@ -437,6 +652,11 @@ USER_COMMANDS_TEXT = (
     "/leave_clan - покинуть клан\n"
     "/clan_deposit <сумма> - пополнить казну клана\n"
     "/clan_info [ID] - информация о клане\n"
+    "/clan_members - участники и вклады (создатель)\n"
+    "/clan_kick <user_id> - исключить участника (создатель)\n"
+    "/clan_type <open|closed> - тип клана (создатель)\n"
+    "/clan_invite <user_id> - пригласить в закрытый клан\n"
+    "/clan_upgrade - прокачать клан-бафф из казны\n"
     "/clans - рейтинг кланов\n\n"
     "⏳ Карточку можно получать каждые 6 часов!"
 )
@@ -455,11 +675,15 @@ ADMIN_ONLY_COMMANDS_TEXT = (
     "/admin_givecoins <user_id> <amount> - выдать монеты\n"
     "/admin_removecoins <user_id> <amount> - забрать монеты\n"
     "/admin_addrarity - добавить редкость\n"
-    "/admin_listrarities - список редкостей\n"
+    "/admin_editrarity - изменить редкость\n"
+    "/admin_listrarities - список редкостей и шансов\n"
     "/admin_addshopitem - добавить товар в магазин\n"
     "/admin_listshop - список товаров\n"
     "/admin_editcard <card_id> - изменить карточку\n"
     "/create_promo - создать промокод\n"
+    "/events - события и посты в канал\n"
+    "/start_season - начать новый рейтинговый сезон\n"
+    "/end_season - завершить сезон и выдать призы\n"
     "/create_match <команда1> <команда2> <часы> - создать матч (приём ставок N часов)\n"
     "/finish_match <match_id> <счёт> - завершить матч (например 3:1)"
 )
@@ -468,8 +692,6 @@ MODERATOR_ONLY_COMMANDS_TEXT = (
     "/admin_addcard - добавить карточку\n"
     "/admin_listcards - список всех карточек\n"
     "/admin_deletecard <card_id> - удалить карточку\n"
-    "/admin_addrarity - добавить редкость\n"
-    "/admin_listrarities - список редкостей\n"
     "/admin_addshopitem - добавить товар в магазин\n"
     "/admin_listshop - список товаров\n"
     "/admin_editcard <card_id> - изменить карточку"
@@ -600,14 +822,11 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("⚠️ В базе нет ни одной карточки! Обратитесь к администратору.")
             return
 
-    RARITY_CHANCES = {
-        "Легендарная": 0.05,
-        "Блещет умом": 0.07,
-        "Эпическая": 0.15,
-        "Редкая": 0.3,
-        "Обычная": 0.5
-    }
+    RARITY_CHANCES = get_drop_weights()
     rarities_list = list(RARITY_CHANCES.keys())
+    if not rarities_list:
+        await update.message.reply_text("⚠️ Нет выпадаемых редкостей! Обратитесь к администратору.")
+        return
     weights = [RARITY_CHANCES[r] for r in rarities_list]
     chosen_rarity = random.choices(rarities_list, weights=weights, k=1)[0]
     rarity_cards = [c for c in cards if c["rarity"] == chosen_rarity]
@@ -716,11 +935,11 @@ async def card_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     emoji = get_rarity_emoji(card["rarity"])
     caption = (
         f"🃏 <b>Информация о карточке</b>\n\n"
-        f"🏷 <b>Название</b>: {card['name']}\n"
-        f"{emoji} <b>Редкость</b>: {card['rarity']}\n"
+        f"🏷 <b>Название</b>: {html.escape(card['name'])}\n"
+        f"{emoji} <b>Редкость</b>: {html.escape(card['rarity'])}\n"
     )
     if "description" in card:
-        caption += f"📝 <b>Описание</b>: {card['description']}\n"
+        caption += f"📝 <b>Описание</b>: {html.escape(card['description'])}\n"
     card_count = user_data["cards"].count(card_id)
     caption += f"📊 <b>В вашей коллекции</b>: {card_count} шт.\n"
     image_path = os.path.join(CARDS_IMAGE_DIR, card["image"])
@@ -800,7 +1019,7 @@ async def daily_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             add_seen_card(user.id, card["id"])
             message += (
                 f"\n🃏 Бонус! Вам выпала карточка:\n"
-                f"🏷 {card['name']} ({get_rarity_emoji(card['rarity'])} {card['rarity']})"
+                f"🏷 {html.escape(card['name'])} ({get_rarity_emoji(card['rarity'])} {html.escape(card['rarity'])})"
             )
 
     await update.message.reply_text(message, parse_mode="HTML")
@@ -900,9 +1119,9 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cards = load_data(CARDS_FILE, [])
         card = next((c for c in cards if c["id"] == card_id), None)
         if card:
-            card_name = card["name"]
-            card_rarity = card["rarity"]
-            emoji = get_rarity_emoji(card_rarity)
+            card_name = html.escape(card["name"])
+            card_rarity = html.escape(card["rarity"])
+            emoji = get_rarity_emoji(card["rarity"])
         else:
             card_name = f"Карточка ID {card_id}"
             card_rarity = "Неизвестная"
@@ -944,6 +1163,7 @@ async def admin_addcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
         return ConversationHandler.END
+    context.user_data.clear()
     await update.message.reply_text("Введите название новой карточки:")
     return ADMIN_CARD_NAME
 
@@ -1017,7 +1237,7 @@ async def admin_listcards(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     message = "<b>Список всех карточек:</b>\n\n"
     for card in sorted_cards:
         emoji = get_rarity_emoji(card["rarity"])
-        message += f"{card['id']}. {html.escape(card['name'])} ({emoji} {card['rarity']})\n"
+        message += f"{card['id']}. {html.escape(card['name'])} ({emoji} {html.escape(card['rarity'])})\n"
     if len(message) > 4000:
         parts = []
         while message:
@@ -1330,16 +1550,21 @@ async def admin_removecoins(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except ValueError:
         await update.message.reply_text("❌ Неверный формат параметров! Используйте только цифры.")
 
-# Редкости
+# Редкости (только админ)
 async def admin_addrarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not has_admin_access(update.effective_user.id):
-        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
         return ConversationHandler.END
+    context.user_data.clear()
     await update.message.reply_text("Введите название новой редкости:")
     return ADMIN_RARITY_NAME
 
 async def admin_rarity_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_rarity"] = {"name": update.message.text}
+    name = update.message.text.strip()
+    if is_default_rarity(name):
+        await update.message.reply_text("❌ Это стандартная редкость из кода — добавить её нельзя. Выберите другое название.")
+        return ADMIN_RARITY_NAME
+    context.user_data["new_rarity"] = {"name": name}
     await update.message.reply_text("Введите смайлик для этой редкости:")
     return ADMIN_RARITY_EMOJI
 
@@ -1359,19 +1584,42 @@ async def admin_rarity_droppable(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("❌ Неверный формат! Введите 1 или 0.")
         return ADMIN_RARITY_DROPPABLE
+    context.user_data["new_rarity"]["droppable"] = bool(droppable)
+    if context.user_data["new_rarity"]["droppable"]:
+        await update.message.reply_text(
+            "Введите шанс выпадения (от 0.001 до 1.0).\n"
+            "Пример: 0.05 = 5%"
+        )
+        return ADMIN_RARITY_CHANCE
+    context.user_data["new_rarity"]["chance"] = 0
+    return await _save_new_rarity(update, context)
+
+async def admin_rarity_chance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        chance = float(update.message.text.replace(",", "."))
+        if not (0.001 <= chance <= 1.0):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите число от 0.001 до 1.0.")
+        return ADMIN_RARITY_CHANCE
+    context.user_data["new_rarity"]["chance"] = chance
+    return await _save_new_rarity(update, context)
+
+async def _save_new_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     new_rarity = context.user_data["new_rarity"]
-    new_rarity["droppable"] = bool(droppable)
     rarities = load_data(RARITIES_FILE, [])
+    if any(r["name"] == new_rarity["name"] for r in rarities):
+        await update.message.reply_text("❌ Редкость с таким названием уже существует.")
+        context.user_data.clear()
+        return ConversationHandler.END
     rarities.append(new_rarity)
     save_data(RARITIES_FILE, rarities)
+    chance_text = f"{new_rarity.get('chance', 0) * 100:.2f}%" if new_rarity.get("droppable") else "—"
     await update.message.reply_text(
         f"✅ Редкость '{new_rarity['name']}' успешно добавлена!\n"
         f"Смайлик: {new_rarity['emoji']}\n"
-        f"Выпадает через /get_card: {'Да' if new_rarity['droppable'] else 'Нет'}"
-    )
-    await log_moderator_action(
-        context, update.effective_user.id,
-        f"Добавил новую редкость: {new_rarity['name']} {new_rarity['emoji']}"
+        f"Выпадает через /get_card: {'Да' if new_rarity['droppable'] else 'Нет'}\n"
+        f"Шанс выпадения: {chance_text}"
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -1382,26 +1630,143 @@ async def cancel_addrarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 async def admin_listrarities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not has_admin_access(update.effective_user.id):
-        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
         return
-    rarities = load_data(RARITIES_FILE, [])
-    if not rarities:
+    all_rarities = get_all_rarity_chances_display()
+    if not all_rarities:
         await update.message.reply_text("ℹ️ Редкостей нет в базе данных.")
         return
-    message = "<b>Список всех редкостей:</b>\n\n"
-    for rarity in rarities:
+    total_chance = sum(r["chance"] for r in all_rarities if r["droppable"])
+    message = "<b>📊 Список редкостей и шансов выпадения</b>\n\n"
+    for rarity in all_rarities:
+        pct = rarity["chance"] * 100
+        norm_pct = (rarity["chance"] / total_chance * 100) if total_chance > 0 and rarity["droppable"] else 0
+        lock = " 🔒" if rarity["is_default"] else ""
         message += (
-            f"{rarity['emoji']} <b>Название</b>: {html.escape(rarity['name'])}\n"
-            f"📦 Выпадает через /get_card: {'Да' if rarity.get('droppable', True) else 'Нет'}\n\n"
+            f"{rarity['emoji']} <b>{html.escape(rarity['name'])}</b>{lock}\n"
+            f"   📦 Выпадает: {'Да' if rarity['droppable'] else 'Нет'}\n"
+            f"   🎲 Шанс: {pct:.2f}%"
         )
+        if rarity["droppable"] and total_chance > 0:
+            message += f" (≈{norm_pct:.1f}% от пула)"
+        if rarity["is_default"]:
+            message += " — <i>стандартная, изменить нельзя</i>"
+        message += "\n\n"
+    boosts = get_active_drop_boosts()
+    if boosts:
+        message += "<b>⚡ Активные бусты:</b>\n"
+        for b in boosts:
+            left = int((b["until"] - time.time()) // 60)
+            message += f"• {html.escape(b['rarity'])} x{b.get('multiplier', 2)} — ещё {left} мин\n"
     await update.message.reply_text(message, parse_mode="HTML")
+
+async def admin_editrarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
+        return ConversationHandler.END
+    rarities = load_data(RARITIES_FILE, [])
+    custom = [r for r in rarities if not is_default_rarity(r["name"])]
+    if not custom:
+        await update.message.reply_text("ℹ️ Нет пользовательских редкостей для редактирования.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    lines = "\n".join(f"• {r['emoji']} {html.escape(r['name'])}" for r in custom)
+    await update.message.reply_text(
+        f"<b>Редактирование редкости</b>\n\nДоступные редкости:\n{lines}\n\n"
+        "Введите название редкости для редактирования:",
+        parse_mode="HTML"
+    )
+    return ADMIN_EDIT_RARITY_NAME
+
+async def admin_edit_rarity_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if is_default_rarity(name):
+        await update.message.reply_text("❌ Стандартные редкости нельзя редактировать.")
+        return ADMIN_EDIT_RARITY_NAME
+    rarities = load_data(RARITIES_FILE, [])
+    rarity = next((r for r in rarities if r["name"] == name), None)
+    if not rarity:
+        await update.message.reply_text("❌ Редкость не найдена. Введите название из списка.")
+        return ADMIN_EDIT_RARITY_NAME
+    context.user_data["edit_rarity"] = rarity
+    await update.message.reply_text(
+        f"Редактируем: {rarity['emoji']} {rarity['name']}\n\n"
+        f"Текущий смайлик: {rarity['emoji']}\nВведите новый смайлик (или «-» чтобы оставить):"
+    )
+    return ADMIN_EDIT_RARITY_EMOJI
+
+async def admin_edit_rarity_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text != "-":
+        context.user_data["edit_rarity"]["emoji"] = text
+    await update.message.reply_text(
+        "Могут ли карточки выпадать через /get_card?\n"
+        "1 - Да, 0 - Нет (или «-» оставить текущее):"
+    )
+    return ADMIN_EDIT_RARITY_DROPPABLE
+
+async def admin_edit_rarity_droppable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text != "-":
+        try:
+            val = int(text)
+            if val not in [0, 1]:
+                raise ValueError
+            context.user_data["edit_rarity"]["droppable"] = bool(val)
+        except ValueError:
+            await update.message.reply_text("❌ Введите 1, 0 или «-».")
+            return ADMIN_EDIT_RARITY_DROPPABLE
+    if context.user_data["edit_rarity"].get("droppable", True):
+        await update.message.reply_text(
+            "Введите новый шанс выпадения (0.001–1.0) или «-» чтобы оставить текущий:"
+        )
+        return ADMIN_EDIT_RARITY_CHANCE
+    context.user_data["edit_rarity"]["chance"] = 0
+    return await _save_edited_rarity(update, context)
+
+async def admin_edit_rarity_chance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text != "-":
+        try:
+            chance = float(text.replace(",", "."))
+            if not (0.001 <= chance <= 1.0):
+                raise ValueError
+            context.user_data["edit_rarity"]["chance"] = chance
+        except ValueError:
+            await update.message.reply_text("❌ Введите число от 0.001 до 1.0 или «-».")
+            return ADMIN_EDIT_RARITY_CHANCE
+    return await _save_edited_rarity(update, context)
+
+async def _save_edited_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    edited = context.user_data["edit_rarity"]
+    rarities = load_data(RARITIES_FILE, [])
+    for i, r in enumerate(rarities):
+        if r["name"] == edited["name"]:
+            rarities[i] = edited
+            break
+    save_data(RARITIES_FILE, rarities)
+    chance_text = f"{edited.get('chance', 0) * 100:.2f}%" if edited.get("droppable") else "—"
+    await update.message.reply_text(
+        f"✅ Редкость «{edited['name']}» обновлена!\n"
+        f"Смайлик: {edited['emoji']}\n"
+        f"Выпадает: {'Да' if edited.get('droppable') else 'Нет'}\n"
+        f"Шанс: {chance_text}"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_editrarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Редактирование отменено.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 # Магазин админ
 async def admin_addshopitem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not has_admin_access(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
         return ConversationHandler.END
+    context.user_data.clear()
     await update.message.reply_text("Введите название товара:")
     return ADMIN_SHOP_NAME
 
@@ -1557,6 +1922,7 @@ async def admin_editcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not card:
             await update.message.reply_text("❌ Карточка не найдена!")
             return ConversationHandler.END
+        context.user_data.clear()
         context.user_data["edit_card"] = card
         context.user_data["card_id"] = card_id
         keyboard = [
@@ -1654,15 +2020,16 @@ async def start_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user.id), {})
-    user_cards = user_data.get("cards", [])
+    user_cards = get_available_card_ids(user.id)
     if len(user_cards) < 3:
-        await update.message.reply_text("❌ У вас менее 3 карточек в коллекции!")
+        await update.message.reply_text("❌ У вас менее 3 доступных карточек в коллекции!")
         return ConversationHandler.END
     message = await show_collection_with_ids(user.id)
     message += "\n\n🛠 <b>Система крафта</b>\n" \
                "Выберите 3 карточки ОДНОЙ редкости (Обычная или Редкая) для улучшения.\n" \
                "Введите ID карточек через пробел (например: 5 12 8):"
     await update.message.reply_text(message, parse_mode="HTML")
+    context.user_data.clear()
     return CRAFT_SELECT_CARDS
 
 async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1677,11 +2044,18 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return CRAFT_SELECT_CARDS
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user.id), {})
-    user_cards = user_data.get("cards", [])
-    missing_cards = [card_id for card_id in card_ids if card_id not in user_cards]
+    available = get_available_card_ids(user.id)
+    available_temp = list(available)
+    missing_cards = []
+    for card_id in card_ids:
+        if card_id in available_temp:
+            available_temp.remove(card_id)
+        else:
+            missing_cards.append(card_id)
     if missing_cards:
-        await update.message.reply_text(f"❌ У вас нет карточек с ID: {', '.join(map(str, missing_cards))}")
+        await update.message.reply_text(f"❌ Карточки недоступны (нет в коллекции, на маркете или в работе): {', '.join(map(str, missing_cards))}")
         return CRAFT_SELECT_CARDS
+    user_cards = user_data.get("cards", [])
     cards_data = load_data(CARDS_FILE, [])
     selected_cards = [c for c in cards_data if c["id"] in card_ids]
     rarities = set(card["rarity"] for card in selected_cards)
@@ -1725,7 +2099,7 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 async def cancel_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Крафт отменен.")
+    await update.message.reply_text("❌ Действие отменено.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1753,8 +2127,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     rare_leaders = []
     total_cards_leaders = []
-    unique_cards_leaders = []
-    buff_leaders = []
+    rating_leaders = []
 
     for user_id, user_data in users_data.items():
         uid = int(user_id)
@@ -1764,21 +2137,15 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         rare_count = sum(1 for card_id in user_cards if card_id in rare_cards)
         rare_leaders.append((uid, rare_count))
         total_cards_leaders.append((uid, len(user_cards)))
-        unique_cards_leaders.append((uid, len(set(user_cards))))
-        buff = user_data.get("buff_card")
-        buff_level = buff.get("level", 0) if buff else 0
-        if buff_level > 0:
-            buff_leaders.append((uid, buff_level))
+        rating_leaders.append((uid, user_data.get("rating_elo", DEFAULT_RATING_ELO)))
 
     rare_leaders.sort(key=lambda x: x[1], reverse=True)
     total_cards_leaders.sort(key=lambda x: x[1], reverse=True)
-    unique_cards_leaders.sort(key=lambda x: x[1], reverse=True)
-    buff_leaders.sort(key=lambda x: x[1], reverse=True)
+    rating_leaders.sort(key=lambda x: x[1], reverse=True)
 
     rare_top = rare_leaders[:5]
     total_cards_top = total_cards_leaders[:5]
-    unique_cards_top = unique_cards_leaders[:5]
-    buff_top = buff_leaders[:5]
+    rating_top = rating_leaders[:3]
 
     async def format_section(title: str, entries, unit: str) -> str:
         section = f"\n<b>{title}</b>\n"
@@ -1788,7 +2155,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             try:
                 user_chat = await context.bot.get_chat(user_id)
                 username = user_chat.username or f"ID: {user_id}"
-                section += f"{i}. @{username}: {value} {unit}\n"
+                section += f"{i}. @{html.escape(username)}: {value} {unit}\n"
             except Exception:
                 section += f"{i}. ID {user_id}: {value} {unit}\n"
         return section
@@ -1797,8 +2164,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     message += await format_section("💰 Топ по монетам:", coins_top, "монет")
     message += await format_section("🃏 Топ по редким карточкам:", rare_top, "карточек")
     message += await format_section("📚 Топ по общему количеству карточек:", total_cards_top, "карточек")
-    message += await format_section("📖 Рейтинг по коллекциям (уникальные карточки):", unique_cards_top, "уникальных карточек")
-    message += await format_section("⚡ Топ по уровню баффа:", buff_top, "уровень")
+    message += await format_section("⭐ Топ-3 рейтингового режима:", rating_top, "рейтинга")
 
     await update.message.reply_text(message, parse_mode="HTML")
 
@@ -1976,8 +2342,8 @@ async def buff_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     current_cooldown_hours = 6 * (1 - cooldown_reduction / 100)
     message = (
         f"🃏 <b>Ваш активный бафф</b>\n\n"
-        f"Карта: {card['name']} (ID: {card_id})\n"
-        f"Редкость: {card['rarity']}\n"
+        f"Карта: {html.escape(card['name'])} (ID: {card_id})\n"
+        f"Редкость: {html.escape(card['rarity'])}\n"
         f"Уровень: {level}\n\n"
         f"<b>Эффекты:</b>\n"
         f"⏳ Уменьшение кулдауна: -{cooldown_reduction}% (текущий кулдаун: {current_cooldown_hours:.1f} ч)\n"
@@ -2004,9 +2370,9 @@ async def set_buff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user.id), {})
-    user_cards = user_data.get("cards", [])
+    user_cards = get_available_card_ids(user.id)
     if card_id not in user_cards:
-        await update.message.reply_text("❌ У вас нет такой карточки в коллекции!")
+        await update.message.reply_text("❌ У вас нет такой карточки или она недоступна (на маркете/в работе).")
         return
     cards = load_data(CARDS_FILE, [])
     card = next((c for c in cards if c["id"] == card_id), None)
@@ -2149,6 +2515,7 @@ async def create_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Эта команда доступна только администратору!")
         return ConversationHandler.END
+    context.user_data.clear()
     await update.message.reply_text("Введите код промокода (латиница, без пробелов):")
     return PROMO_NAME
 
@@ -2314,14 +2681,25 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         level = buff["level"]
         card = next((c for c in cards if c["id"] == card_id), None)
         card_name = card["name"] if card else f"ID {card_id}"
-        message += f"⚡ Активный бафф: <b>{card_name}</b> (уровень {level})\n"
+        message += f"⚡ Активный бафф: <b>{html.escape(card_name)}</b> (уровень {level})\n"
     else:
         message += "⚡ Активный бафф: <b>нет</b>\n"
 
     await update.message.reply_text(message, parse_mode="HTML")
 
-# ============================ ПЕРЕДАЧА КАРТОЧКИ (ПОДАРОК) ============================
-async def givecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ============================ ТРЕЙД СИСТЕМА ============================
+def _next_trade_id() -> int:
+    trades = load_data(TRADES_FILE, [])
+    return max((t["id"] for t in trades), default=0) + 1
+
+def _get_trade(trade_id: int):
+    trades = load_data(TRADES_FILE, [])
+    return next((t for t in trades if t["id"] == trade_id), None)
+
+def _save_trades(trades: list) -> None:
+    save_data(TRADES_FILE, trades)
+
+async def trade_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if is_banned(user.id):
         await update.message.reply_text("❌ Вы заблокированы в этом боте.")
@@ -2329,64 +2707,1151 @@ async def givecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_subscribed(user.id, context):
         await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
         return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("ℹ️ Использование: /givecard <user_id> <card_id>")
+    if len(context.args) < 2:
+        await update.message.reply_text("ℹ️ Использование: /trade <user_id> <card_id>")
         return
-
     try:
-        recipient_id = int(args[0])
-        card_id = int(args[1])
+        target_id = int(context.args[0])
+        card_id = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("❌ Неверный формат ID. Используйте только цифры.")
+        await update.message.reply_text("❌ Неверный формат ID.")
         return
-
-    if recipient_id == user.id:
-        await update.message.reply_text("❌ Нельзя передать карточку самому себе.")
+    if target_id == user.id:
+        await update.message.reply_text("❌ Нельзя предложить обмен самому себе.")
         return
-
     users = load_data(USERS_FILE, {})
-    if str(recipient_id) not in users:
-        await update.message.reply_text("❌ Получатель не найден в базе бота.")
+    if str(target_id) not in users:
+        await update.message.reply_text("❌ Игрок не найден в базе бота.")
         return
-
-    user_cards = users.get(str(user.id), {}).get("cards", [])
-    if card_id not in user_cards:
-        await update.message.reply_text("❌ У вас нет такой карточки.")
+    if card_id not in get_available_card_ids(user.id):
+        await update.message.reply_text("❌ У вас нет этой карточки или она недоступна.")
         return
-
     cards = load_data(CARDS_FILE, [])
     card = next((c for c in cards if c["id"] == card_id), None)
     if not card:
-        await update.message.reply_text("❌ Карточка не найдена в базе данных.")
+        await update.message.reply_text("❌ Карточка не найдена.")
         return
-
-    # Удаляем у отправителя
-    user_cards.remove(card_id)
-    users[str(user.id)]["cards"] = user_cards
-
-    # Добавляем получателю
-    if str(recipient_id) not in users:
-        users[str(recipient_id)] = {"cards": [], "last_drop": 0}
-    recipient_cards = users[str(recipient_id)].get("cards", [])
-    recipient_cards.append(card_id)
-    users[str(recipient_id)]["cards"] = recipient_cards
-
-    save_data(USERS_FILE, users)
-    # Теперь добавляем seen_card получателю
-    add_seen_card(recipient_id, card_id)
-
+    trades = load_data(TRADES_FILE, [])
+    active = [t for t in trades if t["status"] in ("pending", "counter", "confirm") and user.id in (t["from_user"], t["to_user"])]
+    if active:
+        await update.message.reply_text("❌ У вас уже есть активное предложение обмена. Дождитесь его завершения.")
+        return
+    trade_id = _next_trade_id()
+    trades.append({
+        "id": trade_id,
+        "from_user": user.id,
+        "to_user": target_id,
+        "from_card": card_id,
+        "to_card": None,
+        "status": "pending",
+        "created": time.time(),
+    })
+    _save_trades(trades)
+    sender_name = user.username or str(user.id)
+    keyboard = [
+        [InlineKeyboardButton("✅ Принять обмен", callback_data=f"trade_accept_{trade_id}")],
+        [InlineKeyboardButton("❌ Отклонить", callback_data=f"trade_decline_{trade_id}")],
+    ]
     await update.message.reply_text(
-        f"✅ Вы передали карточку '{card['name']}' (ID: {card_id}) пользователю {recipient_id}."
+        f"🔄 Предложение обмена отправлено игроку {target_id}!\n"
+        f"Вы предлагаете: {card['name']} ({get_rarity_emoji(card['rarity'])} {card['rarity']})"
     )
     try:
         await context.bot.send_message(
-            recipient_id,
-            f"🎁 Пользователь @{user.username or user.id} передал вам карточку '{card['name']}' (ID: {card_id})!"
+            target_id,
+            f"🔄 <b>Предложение обмена!</b>\n\n"
+            f"От: @{html.escape(sender_name)}\n"
+            f"Предлагает: <b>{html.escape(card['name'])}</b> ({get_rarity_emoji(card['rarity'])} {html.escape(card['rarity'])})\n\n"
+            f"Примите обмен и выберите свою карточку для обмена.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
         )
     except Exception as e:
-        logger.error(f"Не удалось уведомить получателя: {e}")
+        logger.error(f"Не удалось уведомить получателя обмена: {e}")
+
+async def trade_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if data.startswith("trade_decline_"):
+        trade_id = int(data.split("_")[2])
+        trade = _get_trade(trade_id)
+        if not trade or trade["status"] not in ("pending", "counter", "confirm"):
+            await query.edit_message_text("❌ Обмен уже недействителен.")
+            return
+        if user_id not in (trade["from_user"], trade["to_user"]):
+            await query.edit_message_text("❌ Это не ваш обмен.")
+            return
+        trades = load_data(TRADES_FILE, [])
+        trades = [t for t in trades if t["id"] != trade_id]
+        _save_trades(trades)
+        await query.edit_message_text("❌ Обмен отменён.")
+        other = trade["to_user"] if user_id == trade["from_user"] else trade["from_user"]
+        try:
+            await context.bot.send_message(other, "ℹ️ Обмен был отменён второй стороной.")
+        except Exception:
+            pass
+        return
+
+    if data.startswith("trade_accept_"):
+        trade_id = int(data.split("_")[2])
+        trade = _get_trade(trade_id)
+        if not trade or trade["status"] != "pending":
+            await query.edit_message_text("❌ Обмен уже недействителен.")
+            return
+        if user_id != trade["to_user"]:
+            await query.edit_message_text("❌ Это предложение не для вас.")
+            return
+        trade["status"] = "counter"
+        trades = load_data(TRADES_FILE, [])
+        for i, t in enumerate(trades):
+            if t["id"] == trade_id:
+                trades[i] = trade
+                break
+        _save_trades(trades)
+        collection = await show_collection_with_ids(user_id)
+        await query.edit_message_text(
+            f"✅ Вы приняли обмен #{trade_id}!\n\n"
+            f"{collection}\n\n"
+            f"📝 Ответьте сообщением с ID вашей карточки для обмена.",
+            parse_mode="HTML",
+        )
+        context.user_data.clear()
+        context.user_data["trade_counter_id"] = trade_id
+        return
+
+    if data.startswith("trade_confirm_"):
+        trade_id = int(data.split("_")[2])
+        trade = _get_trade(trade_id)
+        if not trade or trade["status"] != "confirm":
+            await query.edit_message_text("❌ Обмен уже недействителен.")
+            return
+        if user_id not in (trade["from_user"], trade["to_user"]):
+            await query.edit_message_text("❌ Это не ваш обмен.")
+            return
+        trade.setdefault("confirmed", [])
+        if user_id in trade["confirmed"]:
+            await query.edit_message_text("✅ Вы уже подтвердили этот обмен.")
+            return
+        trade["confirmed"].append(user_id)
+        trades = load_data(TRADES_FILE, [])
+        for i, t in enumerate(trades):
+            if t["id"] == trade_id:
+                trades[i] = trade
+                break
+        _save_trades(trades)
+        if len(trade["confirmed"]) < 2:
+            await query.edit_message_text("✅ Вы подтвердили обмен! Ждём подтверждения второго игрока...")
+            other = trade["to_user"] if user_id == trade["from_user"] else trade["from_user"]
+            cards = load_data(CARDS_FILE, [])
+            card_map = {c["id"]: c for c in cards}
+            fc = card_map.get(trade["from_card"], {})
+            tc = card_map.get(trade["to_card"], {})
+            try:
+                await context.bot.send_message(
+                    other,
+                    f"✅ Соперник подтвердил обмен!\n"
+                    f"🔄 {fc.get('name', trade['from_card'])} ↔ {tc.get('name', trade['to_card'])}\n"
+                    f"Нажмите «Подтвердить» для завершения.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Подтвердить обмен", callback_data=f"trade_confirm_{trade_id}"),
+                        InlineKeyboardButton("❌ Отмена", callback_data=f"trade_decline_{trade_id}"),
+                    ]]),
+                )
+            except Exception:
+                pass
+            return
+        # Execute trade
+        if not remove_one_card(trade["from_user"], trade["from_card"]):
+            trades = [t for t in trades if t["id"] != trade_id]
+            _save_trades(trades)
+            await query.edit_message_text("❌ Обмен не удался — у отправителя нет карточки.")
+            return
+        if not remove_one_card(trade["to_user"], trade["to_card"]):
+            add_one_card(trade["from_user"], trade["from_card"])
+            trades = [t for t in trades if t["id"] != trade_id]
+            _save_trades(trades)
+            await query.edit_message_text("❌ Обмен не удался — у получателя нет карточки.")
+            return
+        add_one_card(trade["from_user"], trade["to_card"])
+        add_one_card(trade["to_user"], trade["from_card"])
+        trades = [t for t in trades if t["id"] != trade_id]
+        _save_trades(trades)
+        cards = load_data(CARDS_FILE, [])
+        card_map = {c["id"]: c for c in cards}
+        fc = card_map.get(trade["from_card"], {})
+        tc = card_map.get(trade["to_card"], {})
+        msg = (
+            f"🎉 <b>Обмен завершён!</b>\n\n"
+            f"Вы отдали: {html.escape(fc.get('name', str(trade['from_card'])))}\n"
+            f"Вы получили: {html.escape(tc.get('name', str(trade['to_card'])))}"
+        )
+        await query.edit_message_text(msg, parse_mode="HTML")
+        other = trade["to_user"] if user_id == trade["from_user"] else trade["from_user"]
+        other_msg = (
+            f"🎉 <b>Обмен завершён!</b>\n\n"
+            f"Вы отдали: {html.escape(tc.get('name', str(trade['to_card'])))}\n"
+            f"Вы получили: {html.escape(fc.get('name', str(trade['from_card'])))}"
+        )
+        try:
+            await context.bot.send_message(other, other_msg, parse_mode="HTML")
+        except Exception:
+            pass
+
+async def trade_counter_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("bet_state") == "awaiting_amount":
+        return
+    trade_id = context.user_data.get("trade_counter_id")
+    if not trade_id:
+        return
+    user = update.effective_user
+    trade = _get_trade(trade_id)
+    if not trade or trade["status"] != "counter" or user.id != trade["to_user"]:
+        context.user_data.pop("trade_counter_id", None)
+        return
+    try:
+        card_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Введите числовой ID карточки.")
+        return
+    if card_id not in get_available_card_ids(user.id):
+        await update.message.reply_text("❌ У вас нет этой карточки или она недоступна.")
+        return
+    cards = load_data(CARDS_FILE, [])
+    card = next((c for c in cards if c["id"] == card_id), None)
+    if not card:
+        await update.message.reply_text("❌ Карточка не найдена.")
+        return
+    trade["to_card"] = card_id
+    trade["status"] = "confirm"
+    trade["confirmed"] = []
+    trades = load_data(TRADES_FILE, [])
+    for i, t in enumerate(trades):
+        if t["id"] == trade_id:
+            trades[i] = trade
+            break
+    _save_trades(trades)
+    context.user_data.pop("trade_counter_id", None)
+    from_card = next((c for c in cards if c["id"] == trade["from_card"]), {})
+    keyboard = [[
+        InlineKeyboardButton("✅ Подтвердить обмен", callback_data=f"trade_confirm_{trade_id}"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"trade_decline_{trade_id}"),
+    ]]
+    summary = (
+        f"🔄 <b>Обмен #{trade_id}</b>\n\n"
+        f"@{html.escape(user.username or str(user.id))} предлагает:\n"
+        f"• {html.escape(from_card.get('name', '?'))} ↔ {html.escape(card['name'])}\n\n"
+        f"Подтвердите обмен обе стороны."
+    )
+    await update.message.reply_text(f"✅ Вы выбрали {card['name']} для обмена. Ждём подтверждения обоих игроков.")
+    for uid in (trade["from_user"], trade["to_user"]):
+        try:
+            await context.bot.send_message(uid, summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить подтверждение обмена {uid}: {e}")
+
+# ============================ МАРКЕТ ============================
+MARKET_PAGE_SIZE = 10
+
+def _build_market_page(user_id: int, page: int):
+    """Собирает текст и клавиатуру страницы маркета. Возвращает (None, None), если маркет пуст."""
+    market = load_data(MARKET_FILE, [])
+    if not market:
+        return None, None
+    cards = load_data(CARDS_FILE, [])
+    card_map = {c["id"]: c for c in cards}
+    total_pages = max(1, (len(market) + MARKET_PAGE_SIZE - 1) // MARKET_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start_idx = page * MARKET_PAGE_SIZE
+    items = market[start_idx:start_idx + MARKET_PAGE_SIZE]
+    lines = [f"🏪 <b>Маркет карточек</b> — стр. {page + 1}/{total_pages} (всего лотов: {len(market)})\n"]
+    keyboard = []
+    for item in items:
+        card = card_map.get(item["card_id"], {})
+        emoji = get_rarity_emoji(card.get("rarity", ""))
+        lines.append(
+            f"#{item['id']} {emoji} <b>{html.escape(card.get('name', '?'))}</b> — "
+            f"💰 {_fmt_coins(item['price'])} (продавец: {item['seller_id']})"
+        )
+        if item["seller_id"] != user_id:
+            keyboard.append([InlineKeyboardButton(
+                f"Купить #{item['id']} за {_fmt_coins(item['price'])}",
+                callback_data=f"market_buy_{item['id']}"
+            )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Назад", callback_data=f"market_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"market_page_{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    lines.append(f"\nℹ️ /sell {html.escape('<card_id>')} {html.escape('<цена>')} — выставить | /my_listings — мои объявления")
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard) if keyboard else None
+
+async def show_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        return
+    if not await is_subscribed(user.id, context):
+        return
+    text, reply_markup = _build_market_page(user.id, 0)
+    if text is None:
+        await update.message.reply_text("🏪 Маркет пуст. Выставьте карточку: /sell <card_id> <цена>")
+        return
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
+async def market_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перелистывание страниц маркета."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        page = int(query.data.split("_")[2])
+    except (IndexError, ValueError):
+        return
+    text, reply_markup = _build_market_page(query.from_user.id, page)
+    if text is None:
+        await query.edit_message_text("🏪 Маркет пуст. Выставьте карточку: /sell <card_id> <цена>")
+        return
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    except Exception:
+        # Содержимое не изменилось (та же страница) — игнорируем.
+        pass
+
+async def sell_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        return
+    if not await is_subscribed(user.id, context):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("ℹ️ Использование: /sell <card_id> <цена>")
+        return
+    try:
+        card_id = int(context.args[0])
+        price = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат.")
+        return
+    if price <= 0:
+        await update.message.reply_text("❌ Цена должна быть положительной.")
+        return
+    if card_id not in get_available_card_ids(user.id):
+        await update.message.reply_text("❌ Карточка недоступна для продажи.")
+        return
+    cards = load_data(CARDS_FILE, [])
+    card = next((c for c in cards if c["id"] == card_id), None)
+    if not card:
+        await update.message.reply_text("❌ Карточка не найдена.")
+        return
+    min_price = MARKET_MIN_PRICES.get(card["rarity"])
+    if min_price and price < min_price:
+        await update.message.reply_text(f"❌ Минимальная цена для {card['rarity']}: {_fmt_coins(min_price)} монет.")
+        return
+    market = load_data(MARKET_FILE, [])
+    if len([m for m in market if m["seller_id"] == user.id]) >= 3:
+        await update.message.reply_text("❌ У вас уже 3 активных лота. Снимите один через /my_listings.")
+        return
+    if not remove_one_card(user.id, card_id):
+        await update.message.reply_text("❌ Не удалось снять карточку с коллекции.")
+        return
+    market = load_data(MARKET_FILE, [])
+    listing_id = max((m["id"] for m in market), default=0) + 1
+    market.append({
+        "id": listing_id,
+        "seller_id": user.id,
+        "card_id": card_id,
+        "price": price,
+        "listed_at": time.time(),
+    })
+    save_data(MARKET_FILE, market)
+    await update.message.reply_text(
+        f"✅ Карточка «{card['name']}» выставлена на маркет!\n"
+        f"🆔 Объявление #{listing_id}\n💰 Цена: {_fmt_coins(price)} монет\n\n"
+        f"Отменить: /unlist {listing_id}"
+    )
+
+async def my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    market = load_data(MARKET_FILE, [])
+    mine = [m for m in market if m["seller_id"] == user.id]
+    if not mine:
+        await update.message.reply_text("📭 У вас нет активных объявлений.")
+        return
+    cards = load_data(CARDS_FILE, [])
+    card_map = {c["id"]: c for c in cards}
+    lines = ["📋 <b>Ваши объявления</b>\n"]
+    for item in mine:
+        card = card_map.get(item["card_id"], {})
+        lines.append(f"#{item['id']} {html.escape(card.get('name', '?'))} — 💰 {_fmt_coins(item['price'])}")
+    lines.append(f"\nОтменить: /unlist {html.escape('<ID объявления>')}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def unlist_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /unlist <ID объявления>")
+        return
+    try:
+        listing_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID.")
+        return
+    market = load_data(MARKET_FILE, [])
+    item = next((m for m in market if m["id"] == listing_id), None)
+    if not item or item["seller_id"] != user.id:
+        await update.message.reply_text("❌ Объявление не найдено.")
+        return
+    market = [m for m in market if m["id"] != listing_id]
+    save_data(MARKET_FILE, market)
+    add_one_card(user.id, item["card_id"])
+    await update.message.reply_text(f"✅ Объявление #{listing_id} снято, карточка возвращена в коллекцию.")
+
+async def market_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        listing_id = int(query.data.split("_")[2])
+    except (IndexError, ValueError):
+        await query.edit_message_text("❌ Неверные данные.")
+        return
+    buyer_id = query.from_user.id
+    market = load_data(MARKET_FILE, [])
+    item = next((m for m in market if m["id"] == listing_id), None)
+    if not item:
+        await query.edit_message_text("❌ Объявление уже недоступно.")
+        return
+    if item["seller_id"] == buyer_id:
+        await query.edit_message_text("❌ Нельзя купить свою карточку.")
+        return
+    if get_coins(buyer_id) < item["price"]:
+        await query.edit_message_text("❌ Недостаточно монет!")
+        return
+    update_coins(buyer_id, -item["price"])
+    update_coins(item["seller_id"], item["price"])
+    add_one_card(buyer_id, item["card_id"])
+    market = [m for m in market if m["id"] != listing_id]
+    save_data(MARKET_FILE, market)
+    cards = load_data(CARDS_FILE, [])
+    card = next((c for c in cards if c["id"] == item["card_id"]), {})
+    card_name = html.escape(card.get("name", "?"))
+    price_text = _fmt_coins(item["price"])
+    await query.edit_message_text(
+        f"✅ Вы купили «{card_name}» за {price_text} монет!",
+        parse_mode="HTML",
+    )
+    try:
+        await context.bot.send_message(
+            item["seller_id"],
+            f"💰 Ваша карточка «{card_name}» продана за {price_text} монет!",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+# ============================ РАБОТА (/work) ============================
+async def _complete_work_if_ready(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    work = user_data.get("working_card")
+    if not work or time.time() < work.get("finish_at", 0):
+        return False
+    card_id = work["card_id"]
+    reward = work.get("reward", 50)
+    cards = user_data.get("cards", [])
+    cards.append(card_id)
+    user_data["cards"] = cards
+    del user_data["working_card"]
+    users[str(user_id)] = user_data
+    save_data(USERS_FILE, users)
+    new_balance = update_coins(user_id, reward)
+    cards_db = load_data(CARDS_FILE, [])
+    card = next((c for c in cards_db if c["id"] == card_id), {})
+    try:
+        await context.bot.send_message(
+            user_id,
+            f"💼 <b>Карточка вернулась с работы!</b>\n\n"
+            f"🃏 {html.escape(card.get('name', str(card_id)))}\n"
+            f"💰 Заработано: +{reward} монет\n"
+            f"💰 Баланс: {new_balance}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    return True
+
+async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        return
+    if not await is_subscribed(user.id, context):
+        return
+    await _complete_work_if_ready(user.id, context)
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user.id), {})
+    if user_data.get("working_card") and time.time() < user_data["working_card"].get("finish_at", 0):
+        left = int(user_data["working_card"]["finish_at"] - time.time())
+        await update.message.reply_text(f"⏳ Карточка ещё работает. Осталось: {left // 60} мин.")
+        return
+    last_work = user_data.get("last_work", 0)
+    if time.time() - last_work < WORK_COOLDOWN_SECONDS:
+        left = int(WORK_COOLDOWN_SECONDS - (time.time() - last_work))
+        await update.message.reply_text(f"⏳ Следующая работа через {left // 60} мин.")
+        return
+    if not context.args:
+        await update.message.reply_text(f"ℹ️ Использование: /work {html.escape('<card_id>')}\n\n" + await show_collection_with_ids(user.id), parse_mode="HTML")
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID.")
+        return
+    if card_id not in get_available_card_ids(user.id):
+        await update.message.reply_text("❌ Карточка недоступна.")
+        return
+    cards = load_data(CARDS_FILE, [])
+    card = next((c for c in cards if c["id"] == card_id), None)
+    if not card:
+        await update.message.reply_text("❌ Карточка не найдена.")
+        return
+    reward_range = WORK_REWARDS.get(card["rarity"], (15, 30))
+    reward = random.randint(*reward_range)
+    if not remove_one_card(user.id, card_id):
+        await update.message.reply_text("❌ Не удалось отправить карточку на работу.")
+        return
+    user_data = users.get(str(user.id), {})
+    user_data["working_card"] = {
+        "card_id": card_id,
+        "finish_at": time.time() + WORK_DURATION_SECONDS,
+        "reward": reward,
+    }
+    user_data["last_work"] = time.time()
+    users[str(user.id)] = user_data
+    save_data(USERS_FILE, users)
+    await update.message.reply_text(
+        f"💼 <b>{html.escape(card['name'])}</b> отправлена работать на 1 час!\n"
+        f"💰 Ожидаемый заработок: ~{reward} монет\n"
+        f"⏳ Карточка вернётся через 60 минут.",
+        parse_mode="HTML",
+    )
+
+# ============================ СОБЫТИЯ КАНАЛА (/events) ============================
+async def events_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только для администратора!")
+        return
+    keyboard = [
+        [InlineKeyboardButton("⚡ Буст выпадения сейчас", callback_data="evt_boost_now")],
+        [InlineKeyboardButton("⏰ Запланировать буст", callback_data="evt_boost_sched")],
+        [InlineKeyboardButton("🗳 Голосование за промокод", callback_data="evt_poll")],
+        [InlineKeyboardButton("📋 Активные события", callback_data="evt_list")],
+    ]
+    await update.message.reply_text(
+        "🎪 <b>Управление событиями</b>\n\nВыберите тип события:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
+async def events_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    data = query.data
+
+    if data == "evt_list":
+        boosts = get_active_drop_boosts()
+        events = load_data(CHANNEL_EVENTS_FILE, [])
+        active = [e for e in events if e.get("status") in ("scheduled", "active", "poll_active")]
+        text = "📋 <b>Активные события</b>\n\n"
+        if boosts:
+            text += "<b>⚡ Бусты:</b>\n"
+            for b in boosts:
+                left = int((b["until"] - time.time()) // 60)
+                text += f"• {html.escape(b['rarity'])} x{b.get('multiplier', 2)} — {left} мин\n"
+        else:
+            text += "Бустов нет.\n"
+        if active:
+            text += "\n<b>📅 Запланированные:</b>\n"
+            for e in active:
+                text += f"• #{e['id']} {html.escape(e.get('type', ''))} — {html.escape(e.get('status', ''))}\n"
+        await query.edit_message_text(text, parse_mode="HTML")
+        return
+
+    if data == "evt_boost_now":
+        context.user_data.clear()
+        context.user_data["evt_flow"] = "boost_now"
+        await query.edit_message_text(
+            "⚡ <b>Буст выпадения</b>\n\nВведите редкость (например: Легендарная):",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "evt_boost_sched":
+        context.user_data.clear()
+        context.user_data["evt_flow"] = "boost_sched"
+        await query.edit_message_text(
+            "⏰ <b>Запланированный буст</b>\n\nЧерез сколько минут начать? (число):",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "evt_poll":
+        context.user_data.clear()
+        context.user_data["evt_flow"] = "poll"
+        keyboard = [
+            [InlineKeyboardButton("⏱ Сброс таймера", callback_data="evt_poll_reset")],
+            [InlineKeyboardButton("💰 Монеты", callback_data="evt_poll_coins")],
+        ]
+        await query.edit_message_text(
+            "🗳 <b>Голосование за промокод</b>\n\nВыберите тип награды:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return
+
+    if data in ("evt_poll_reset", "evt_poll_coins"):
+        context.user_data.clear()
+        context.user_data["evt_flow"] = "poll"
+        context.user_data["evt_poll_type"] = "reset" if data == "evt_poll_reset" else "coins"
+        if data == "evt_poll_reset":
+            await query.edit_message_text("💰 Если победят монеты, на какое количество выпустить промокод?")
+        else:
+            await query.edit_message_text("💰 Введите количество монет для промокода:")
+        return
+
+async def events_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("bet_state") == "awaiting_amount":
+        return
+    if context.user_data.get("trade_counter_id"):
+        return
+    flow = context.user_data.get("evt_flow")
+    if not flow or not is_admin(update.effective_user.id):
+        return
+    text = update.message.text.strip()
+
+    if flow == "boost_now":
+        step = context.user_data.get("evt_step", "rarity")
+        if step == "rarity":
+            context.user_data["evt_rarity"] = text
+            context.user_data["evt_step"] = "mult"
+            await update.message.reply_text("Введите множитель шанса (например 2 или 3):")
+            return
+        if step == "mult":
+            try:
+                mult = float(text.replace(",", "."))
+                if mult <= 1:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Множитель должен быть > 1.")
+                return
+            context.user_data["evt_mult"] = mult
+            context.user_data["evt_step"] = "duration"
+            await update.message.reply_text("Длительность буста в минутах (например 15):")
+            return
+        if step == "duration":
+            try:
+                mins = int(text)
+                if mins <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Введите положительное число минут.")
+                return
+            rarity = context.user_data["evt_rarity"]
+            mult = context.user_data["evt_mult"]
+            until = time.time() + mins * 60
+            boosts = load_data(DROP_BOOSTS_FILE, [])
+            boosts.append({"rarity": rarity, "multiplier": mult, "until": until})
+            save_data(DROP_BOOSTS_FILE, boosts)
+            await post_to_channel(
+                context,
+                f"⚡ <b>СОБЫТИЕ!</b>\n\n"
+                f"Увеличен шанс выпадения <b>{html.escape(rarity)}</b> карточек!\n"
+                f"Множитель: x{mult}\n"
+                f"⏳ Длительность: {mins} минут\n\n"
+                f"🔥 Успей получить карточку: /get_card в боте!",
+            )
+            await update.message.reply_text(f"✅ Буст {rarity} x{mult} активирован на {mins} мин!")
+            context.user_data.pop("evt_flow", None)
+            context.user_data.pop("evt_step", None)
+            return
+
+    if flow == "boost_sched":
+        step = context.user_data.get("evt_step", "delay")
+        if step == "delay":
+            try:
+                delay = int(text)
+                if delay < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Введите число минут.")
+                return
+            context.user_data["evt_delay"] = delay
+            context.user_data["evt_step"] = "rarity"
+            await update.message.reply_text("Введите редкость:")
+            return
+        if step == "rarity":
+            context.user_data["evt_rarity"] = text
+            context.user_data["evt_step"] = "mult"
+            await update.message.reply_text("Множитель шанса:")
+            return
+        if step == "mult":
+            try:
+                mult = float(text.replace(",", "."))
+                if mult <= 1:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Множитель > 1.")
+                return
+            context.user_data["evt_mult"] = mult
+            context.user_data["evt_step"] = "duration"
+            await update.message.reply_text("Длительность буста (минуты):")
+            return
+        if step == "duration":
+            try:
+                mins = int(text)
+                if mins <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Положительное число.")
+                return
+            delay = context.user_data["evt_delay"]
+            rarity = context.user_data["evt_rarity"]
+            mult = context.user_data["evt_mult"]
+            start_at = time.time() + delay * 60
+            end_at = start_at + mins * 60
+            events = load_data(CHANNEL_EVENTS_FILE, [])
+            eid = max((e["id"] for e in events), default=0) + 1
+            events.append({
+                "id": eid, "type": "scheduled_boost", "status": "scheduled",
+                "rarity": rarity, "multiplier": mult,
+                "start_at": start_at, "end_at": end_at, "duration_minutes": mins,
+            })
+            save_data(CHANNEL_EVENTS_FILE, events)
+            await update.message.reply_text(
+                f"✅ Буст запланирован! Начало через {delay} мин, длительность {mins} мин.\n"
+                f"ID события: {eid}"
+            )
+            context.user_data.pop("evt_flow", None)
+            context.user_data.pop("evt_step", None)
+            return
+
+    if flow == "poll":
+        poll_type = context.user_data.get("evt_poll_type", "reset")
+        step = context.user_data.get("evt_step", "value")
+        if step == "value":
+            try:
+                value = int(text)
+                if value <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Положительное число.")
+                return
+            context.user_data["evt_poll_value"] = value
+            context.user_data["evt_step"] = "duration"
+            if poll_type == "reset":
+                await update.message.reply_text(
+                    "💰 Если победят монеты, промокод будет на это количество монет.\n"
+                    "Сколько минут длится голосование?"
+                )
+            else:
+                await update.message.reply_text("Сколько минут длится голосование?")
+            return
+        if step == "duration":
+            try:
+                poll_mins = int(text)
+                if poll_mins <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Положительное число минут.")
+                return
+            context.user_data["evt_poll_duration"] = poll_mins
+            context.user_data["evt_step"] = "promo_hours"
+            await update.message.reply_text("Срок действия промокода после создания (часов, 0 = бессрочно):")
+            return
+        if step == "promo_hours":
+            try:
+                promo_hours = float(text.replace(",", "."))
+                if promo_hours < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Число >= 0.")
+                return
+            poll_mins = context.user_data["evt_poll_duration"]
+            poll_type = context.user_data["evt_poll_type"]
+            poll_value = context.user_data.get("evt_poll_value", 0)
+            end_at = time.time() + poll_mins * 60
+            if poll_type == "reset":
+                promo_label = "сброс таймера"
+                options = ["Сброс таймера", "Монеты"]
+            else:
+                promo_label = f"{poll_value} монет"
+                options = [f"{poll_value // 2} монет", f"{poll_value} монет"]
+            question = f"Какой промокод выпустить? ({promo_label})"
+            poll_seconds = int(poll_mins * 60)
+            send_poll_kwargs = {
+                "chat_id": CHANNEL_ID,
+                "question": f"🗳 {question}",
+                "options": options,
+                "is_anonymous": True,
+                "allows_multiple_answers": False,
+            }
+            if poll_seconds <= 600:
+                send_poll_kwargs["open_period"] = poll_seconds
+            try:
+                poll_msg = await context.bot.send_poll(**send_poll_kwargs)
+            except Exception as e:
+                await update.message.reply_text(f"❌ Не удалось создать голосование: {e}")
+                context.user_data.clear()
+                return
+            events = load_data(CHANNEL_EVENTS_FILE, [])
+            eid = max((e["id"] for e in events), default=0) + 1
+            events.append({
+                "id": eid, "type": "poll", "status": "poll_active",
+                "poll_id": getattr(poll_msg.poll, "id", None),
+                "poll_message_id": poll_msg.message_id,
+                "poll_chat_id": CHANNEL_ID,
+                "end_at": end_at,
+                "promo_type": poll_type,
+                "promo_value": poll_value,
+                "promo_duration_hours": promo_hours,
+                "options": options,
+            })
+            save_data(CHANNEL_EVENTS_FILE, events)
+            await update.message.reply_text(f"✅ Голосование запущено в канале! ID: {eid}, длительность {poll_mins} мин.")
+            context.user_data.clear()
+
+
+async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Диспетчер текстовых сообщений для нескольких мини-диалогов:
+    ввод суммы ставки, выбор карточки для обмена, ввод параметров событий.
+    """
+    if context.user_data.get("bet_state") == "awaiting_amount":
+        return await bet_amount(update, context)
+    if context.user_data.get("trade_counter_id"):
+        return await trade_counter_card(update, context)
+    if context.user_data.get("evt_flow"):
+        return await events_text_input(update, context)
+
+
+async def _finalize_poll_event(event: dict, results, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Формирует промокод по итогам закрытого голосования и публикует результат.
+
+    results — список пар (текст варианта, количество голосов).
+    """
+    if event.get("status") != "poll_active":
+        return False
+    try:
+        winner_idx = 0
+        max_votes = 0
+        for i, (_opt_text, votes) in enumerate(results):
+            if votes > max_votes:
+                max_votes = votes
+                winner_idx = i
+        poll_type = event["promo_type"]
+        poll_value = event.get("promo_value", 0)
+        if poll_type == "reset":
+            if winner_idx == 0:
+                code = f"TIMER{_next_promo_id('TIMER')}"
+                promo_data = {"type": "reset", "value": 0}
+                reward_text = "сброс таймера /get_card"
+            else:
+                code = f"COINS{_next_promo_id('COINS')}"
+                promo_data = {"type": "coins", "value": poll_value}
+                reward_text = f"{poll_value} монет"
+        else:
+            final_value = poll_value if winner_idx == 1 else max(poll_value // 2, 10)
+            code = f"COINS{_next_promo_id('COINS')}"
+            promo_data = {"type": "coins", "value": final_value}
+            reward_text = f"{final_value} монет"
+        promo_hours = event.get("promo_duration_hours", 1)
+        now = time.time()
+        expire = 0 if promo_hours == 0 else now + promo_hours * 3600
+        promos = load_data(PROMOCODES_FILE, {})
+        promos[code] = {
+            "type": promo_data["type"],
+            "value": promo_data["value"],
+            "max_uses": max(max_votes * 2, 10),
+            "used": 0,
+            "users": [],
+            "expire": expire,
+        }
+        save_data(PROMOCODES_FILE, promos)
+        event["status"] = "completed"
+        event["promo_code"] = code
+        expire_text = f"{int(promo_hours)} ч." if promo_hours else "бессрочно"
+        logger.info(f"Голосование завершено: промокод {code}, награда {reward_text}")
+        await context.bot.send_message(
+            CHANNEL_ID,
+            f"🎉 <b>Голосование завершено!</b>\n\n"
+            f"🏆 Победил: {html.escape(results[winner_idx][0])} ({max_votes} голосов)\n\n"
+            f"🎁 Промокод: <code>{code}</code>\n"
+            f"🎁 Награда: {reward_text}\n"
+            f"⏳ Действует: {expire_text}\n\n"
+            f"Активировать: /redeem {code}",
+            parse_mode="HTML",
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка завершения голосования: {e}")
+        event["status"] = "completed"
+        # Статус изменён — событие нужно сохранить, иначе цикл будет повторяться.
+        return True
+
+
+async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает обновления о состоянии голосования.
+
+    Кэширует текущие голоса в событие при каждом апдейте: Telegram НЕ присылает
+    финальный Poll-апдейт, когда опрос закрывается автоматически по open_period,
+    поэтому кэш — единственный источник итогов для фонового воркера.
+    """
+    poll = update.poll
+    if not poll:
+        return
+    events = load_data(CHANNEL_EVENTS_FILE, [])
+    changed = False
+    for event in events:
+        if event.get("status") == "poll_active" and event.get("poll_id") == poll.id:
+            event["last_results"] = [opt.voter_count for opt in poll.options]
+            changed = True
+            if poll.is_closed:
+                results = [(opt.text, opt.voter_count) for opt in poll.options]
+                await _finalize_poll_event(event, results, context)
+            break
+    if changed:
+        save_data(CHANNEL_EVENTS_FILE, events)
+
+
+async def process_channel_events(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = time.time()
+    events = load_data(CHANNEL_EVENTS_FILE, [])
+    changed = False
+    for event in events:
+        if event.get("status") == "scheduled" and event.get("type") == "scheduled_boost":
+            if now >= event.get("start_at", 0):
+                boosts = load_data(DROP_BOOSTS_FILE, [])
+                boosts.append({
+                    "rarity": event["rarity"],
+                    "multiplier": event.get("multiplier", 2),
+                    "until": event["end_at"],
+                })
+                save_data(DROP_BOOSTS_FILE, boosts)
+                event["status"] = "active"
+                changed = True
+                mins = event.get("duration_minutes", 15)
+                try:
+                    await context.bot.send_message(
+                        CHANNEL_ID,
+                        f"⚡ <b>СОБЫТИЕ НАЧАЛОСЬ!</b>\n\n"
+                        f"Увеличен шанс выпадения <b>{html.escape(event['rarity'])}</b>!\n"
+                        f"Множитель: x{event.get('multiplier', 2)}\n"
+                        f"⏳ На {mins} минут!",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+        if event.get("status") == "active" and event.get("type") == "scheduled_boost":
+            if now >= event.get("end_at", 0):
+                event["status"] = "completed"
+                changed = True
+                try:
+                    await context.bot.send_message(
+                        CHANNEL_ID,
+                        f"⏹ Буст <b>{html.escape(event['rarity'])}</b> завершён!",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+        if event.get("status") == "poll_active" and now >= event.get("end_at", 0):
+            poll = None
+            try:
+                poll = await context.bot.stop_poll(event["poll_chat_id"], event["poll_message_id"])
+            except Exception as e:
+                # Опрос уже закрыт Telegram'ом (open_period) — это штатная ситуация,
+                # финализируем по закэшированным голосам вместо тихого completed.
+                logger.warning(f"stop_poll не удался (вероятно, опрос уже закрыт): {e}")
+            if poll is not None:
+                results = [(opt.text, opt.voter_count) for opt in poll.options]
+            else:
+                cached = event.get("last_results") or []
+                opts = event.get("options", [])
+                total = max(len(opts), len(cached))
+                results = [
+                    (
+                        opts[i] if i < len(opts) else f"Вариант {i + 1}",
+                        cached[i] if i < len(cached) else 0,
+                    )
+                    for i in range(total)
+                ]
+            if await _finalize_poll_event(event, results, context):
+                changed = True
+    if changed:
+        save_data(CHANNEL_EVENTS_FILE, events)
+    get_active_drop_boosts()
+    users = load_data(USERS_FILE, {})
+    for uid in list(users.keys()):
+        try:
+            await _complete_work_if_ready(int(uid), context)
+        except Exception:
+            pass
+
+
+async def _event_worker(application: Application) -> None:
+    """Фоновая задача, которая гарантированно отслеживает события канала."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            context = CallbackContext(application)
+            await process_channel_events(context)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("Ошибка в фоновом обработчике событий")
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            break
+
+
+async def _post_init(application: Application) -> None:
+    """Запускает фоновый воркер после инициализации приложения."""
+    application.create_task(_event_worker(application))
+
+# ============================ СЕЗОНЫ РЕЙТИНГА ============================
+async def start_season_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только для администратора!")
+        return ConversationHandler.END
+    season = load_data(SEASON_FILE, {})
+    if season.get("active"):
+        await update.message.reply_text(
+            f"⚠️ Сезон #{season.get('number', '?')} уже активен. Сначала /end_season"
+        )
+        return ConversationHandler.END
+    context.user_data.clear()
+    await update.message.reply_text("🏆 Введите номер нового сезона (1, 2, 3...):")
+    return SEASON_NUMBER
+
+async def season_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        num = int(update.message.text.strip())
+        if num <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Положительное число.")
+        return SEASON_NUMBER
+    context.user_data["season_number"] = num
+    await update.message.reply_text("💰 Монеты за 1 место:")
+    return SEASON_PRIZE_1
+
+async def season_prize_1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        p1 = int(update.message.text.strip())
+        if p1 < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Число >= 0.")
+        return SEASON_PRIZE_1
+    context.user_data["prize_1"] = p1
+    await update.message.reply_text("💰 Монеты за 2 место:")
+    return SEASON_PRIZE_2
+
+async def season_prize_2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        p2 = int(update.message.text.strip())
+        if p2 < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Число >= 0.")
+        return SEASON_PRIZE_2
+    context.user_data["prize_2"] = p2
+    await update.message.reply_text("💰 Монеты за 3 место:")
+    return SEASON_PRIZE_3
+
+async def season_prize_3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        p3 = int(update.message.text.strip())
+        if p3 < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Число >= 0.")
+        return SEASON_PRIZE_3
+    num = context.user_data["season_number"]
+    prizes = [context.user_data["prize_1"], context.user_data["prize_2"], p3]
+    users = load_data(USERS_FILE, {})
+    for uid, data in users.items():
+        data["rating_elo"] = DEFAULT_RATING_ELO
+        data.setdefault("rating_stats", {"wins": 0, "losses": 0, "draws": 0})
+        users[uid] = data
+    save_data(USERS_FILE, users)
+    save_data(SEASON_FILE, {
+        "active": True,
+        "number": num,
+        "prizes": prizes,
+        "started_at": time.time(),
+    })
+    await post_to_channel(
+        context,
+        f"🏆 <b>Начался рейтинговый сезон #{num}!</b>\n\n"
+        f"Рейтинг всех игроков сброшен до {DEFAULT_RATING_ELO}.\n"
+        f"🥇 1 место: {prizes[0]} монет\n"
+        f"🥈 2 место: {prizes[1]} монет\n"
+        f"🥉 3 место: {prizes[2]} монет\n\n"
+        f"⚔️ Играйте: /find_match",
+    )
+    await update.message.reply_text(f"✅ Сезон #{num} начался! Рейтинг сброшен.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_season(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("❌ Отменено.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def end_season_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только для администратора!")
+        return
+    season = load_data(SEASON_FILE, {})
+    if not season.get("active"):
+        await update.message.reply_text("❌ Нет активного сезона.")
+        return
+    users = load_data(USERS_FILE, {})
+    moderators = load_data(MODERATORS_FILE, [])
+    exclude = {ADMIN_ID} | set(moderators)
+    leaders = []
+    for uid, data in users.items():
+        if int(uid) in exclude:
+            continue
+        leaders.append((int(uid), data.get("rating_elo", DEFAULT_RATING_ELO)))
+    leaders.sort(key=lambda x: x[1], reverse=True)
+    top3 = leaders[:3]
+    prizes = season.get("prizes", [0, 0, 0])
+    medals = ["🥇", "🥈", "🥉"]
+    result_lines = [f"🏁 <b>Сезон #{season.get('number')} завершён!</b>\n"]
+    for i, (uid, elo) in enumerate(top3):
+        prize = prizes[i] if i < len(prizes) else 0
+        name = html.escape(await _get_display_name(context, uid))
+        if prize > 0:
+            update_coins(uid, prize)
+            try:
+                await context.bot.send_message(
+                    uid,
+                    f"{medals[i]} Вы заняли {i + 1} место в сезоне #{season.get('number')}!\n"
+                    f"💰 Награда: {prize} монет\n⭐ Рейтинг: {elo}",
+                )
+            except Exception:
+                pass
+        result_lines.append(f"{medals[i]} {name} — ⭐ {elo} (+{prize} монет)")
+    season["active"] = False
+    season["ended_at"] = time.time()
+    save_data(SEASON_FILE, season)
+    await post_to_channel(context, "\n".join(result_lines))
+    await update.message.reply_text("✅ Сезон завершён, призы выданы!")
 
 # ============================ СТАВКИ (БУКМЕКЕРСКАЯ СИСТЕМА) ============================
 def generate_outcomes():
@@ -2585,6 +4050,7 @@ async def bet_outcome_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     parts = data.split("_")
     match_id = int(parts[2])
     outcome_id = int(parts[3])
+    context.user_data.clear()
     context.user_data["bet_outcome_id"] = outcome_id
     context.user_data["bet_match_id"] = match_id
     await query.edit_message_text("Введите сумму ставки (в монетах):")
@@ -2624,7 +4090,9 @@ async def bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if balance < amount:
         await update.message.reply_text("❌ Недостаточно монет.")
         return
+    bet_id = max((b.get("id") or 0 for b in bets), default=0) + 1
     bets.append({
+        "id": bet_id,
         "user_id": user.id,
         "match_id": match_id,
         "outcome_id": outcome_id,
@@ -2662,12 +4130,12 @@ async def my_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = "📋 <b>Мои ставки:</b>\n\n"
     for b in user_bets:
         event = next((e for e in events if e["id"] == b["match_id"]), None)
-        event_name = f"{event['team1']} - {event['team2']}" if event else f"Матч {b['match_id']}"
+        event_name = f"{html.escape(event['team1'])} - {html.escape(event['team2'])}" if event else f"Матч {b['match_id']}"
         outcome_label = "неизвестно"
         if event:
             outcome = next((o for o in event["outcomes"] if o["id"] == b["outcome_id"]), None)
             if outcome:
-                outcome_label = outcome["label"]
+                outcome_label = html.escape(outcome["label"])
         status_emoji = {"pending": "⏳", "win": "✅", "lose": "❌"}
         status_text = {"pending": "Ожидает", "win": "Выигрыш", "lose": "Проигрыш"}
         message += f"🆔 {b.get('id', '?')}: {event_name} -> {outcome_label}\n"
@@ -2685,15 +4153,15 @@ async def rating_team_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
         return ConversationHandler.END
     collection_msg = await show_collection_with_ids(user.id)
-    users = load_data(USERS_FILE, {})
-    user_cards = users.get(str(user.id), {}).get("cards", [])
-    if len(set(user_cards)) < 4:
+    available = get_available_card_ids(user.id)
+    if len(set(available)) < 4:
         await update.message.reply_text(
             "❌ Для составления команды нужно минимум 4 РАЗНЫЕ карточки в коллекции "
             "(1 вратарь + 3 полевых игрока). Получите больше карточек через /get_card."
         )
         return ConversationHandler.END
     await update.message.reply_text(collection_msg, parse_mode="HTML")
+    context.user_data.clear()
     await update.message.reply_text(
         "🥅 Введите ID карточки, которая будет вашим ВРАТАРЁМ:"
     )
@@ -2707,9 +4175,9 @@ async def rating_team_gk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("❌ Введите числовой ID карточки.")
         return RATING_TEAM_GK
     users = load_data(USERS_FILE, {})
-    user_cards = users.get(str(user.id), {}).get("cards", [])
-    if gk_id not in user_cards:
-        await update.message.reply_text("❌ У вас нет такой карточки. Проверьте ID и попробуйте снова.")
+    available = get_available_card_ids(user.id)
+    if gk_id not in available:
+        await update.message.reply_text("❌ У вас нет такой карточки или она недоступна. Проверьте ID и попробуйте снова.")
         return RATING_TEAM_GK
     context.user_data["rating_gk"] = gk_id
     await update.message.reply_text(
@@ -2735,10 +4203,10 @@ async def rating_team_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("❌ Все 4 карточки (вратарь + 3 полевых) должны быть РАЗНЫМИ. Попробуйте снова.")
         return RATING_TEAM_FIELD
     users = load_data(USERS_FILE, {})
-    user_cards = users.get(str(user.id), {}).get("cards", [])
-    missing = [cid for cid in field_ids if cid not in user_cards]
+    available = get_available_card_ids(user.id)
+    missing = [cid for cid in field_ids if cid not in available]
     if missing:
-        await update.message.reply_text(f"❌ У вас нет карточек с ID: {', '.join(map(str, missing))}. Попробуйте снова.")
+        await update.message.reply_text(f"❌ Карточки недоступны: {', '.join(map(str, missing))}. Попробуйте снова.")
         return RATING_TEAM_FIELD
 
     set_rating_team(user.id, gk_id, field_ids)
@@ -2830,6 +4298,13 @@ HIT_EVENTS = [
     "⚔️ {player} ({team}) выигрывает силовую борьбу у борта, но время атаки истекает!",
     "🎣 Обманное движение {player} ({team}) не проходит — {gk} не поддаётся на финт!",
     "🕳 Бросок {player} ({team}) блокирует защитник в последний момент!",
+    "🏒 {player} ({team}) выигрывает вбрасывание и создаёт момент у ворот {gk}!",
+    "⚡ Контратака {team}! {player} выходит один на один, но {gk} читает игру!",
+    "🧊 {player} ({team}) бросает с круга вбрасывания — шайба проходит рядом со штангой!",
+    "🎯 {player} ({team}) расстреливает площадку, но {gk} стоит стеной!",
+    "💫 {player} ({team}) делает no-look pass, но партнёр не успевает принять!",
+    "🔥 Жаркая перепалка у борта — {player} ({team}) получает 2+2!",
+    "🛡 Защитник {team} блокирует бросок {player} телом на линии огня!",
 ]
 GOAL_EVENTS = [
     "🚨 ГОЛ! {player} ({team}) забрасывает шайбу!",
@@ -2881,7 +4356,9 @@ def _pick_field_player(team: dict, card_map: dict) -> int:
 
 def _card_name(card_id, card_map: dict) -> str:
     card = card_map.get(card_id)
-    return card["name"] if card else f"Игрок {card_id}"
+    if not card:
+        return f"Игрок {card_id}"
+    return html.escape(card["name"])
 
 def _generate_period_events(team_a: dict, team_b: dict, card_map: dict, name_a: str, name_b: str, p_a: float):
     """Генерирует события одного периода. Возвращает (events_text_list, goals_a, goals_b)."""
@@ -2925,8 +4402,8 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
     total = strength_a + strength_b if (strength_a + strength_b) > 0 else 1
     p_a = strength_a / total
 
-    name_a = await _get_display_name(context, user_a)
-    name_b = await _get_display_name(context, user_b)
+    name_a = html.escape(await _get_display_name(context, user_a))
+    name_b = html.escape(await _get_display_name(context, user_b))
 
     async def send_both(text: str):
         try:
@@ -3076,6 +4553,10 @@ async def create_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "owner": user.id,
         "members": [user.id],
         "treasury": 0,
+        "contributions": {str(user.id): 0},
+        "type": "open",
+        "invites": [],
+        "buff_upgrade_level": 0,
         "created": time.time()
     }
     clans.append(clan)
@@ -3083,11 +4564,11 @@ async def create_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     set_user_clan_id(user.id, new_id)
 
     await update.message.reply_text(
-        f"🏰 <b>Клан «{name}» создан!</b>\n"
+        f"🏰 <b>Клан «{html.escape(name)}» создан!</b>\n"
         f"🆔 ID клана: {new_id}\n"
         f"💰 С вашего баланса списано {_fmt_coins(CLAN_CREATE_COST)} монет.\n\n"
         f"👥 Приглашайте участников: /join_clan {new_id}\n"
-        f"🏦 Пополняйте казну клана: /clan_deposit <сумма>\n"
+        f"🏦 Пополняйте казну клана: /clan_deposit {html.escape('<сумма>')}\n"
         f"📊 Топ-3 клана по казне получают бафф к монетам — смотрите /clans",
         parse_mode="HTML"
     )
@@ -3118,7 +4599,21 @@ async def join_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Клан с таким ID не найден. Список кланов: /clans")
         return
 
+    if clan.get("type", "open") == "closed":
+        invites = clan.get("invites", [])
+        if user.id not in invites:
+            await update.message.reply_text(
+                "🔒 Это закрытый клан — вступление только по приглашению.\n"
+                "Попросите создателя пригласить вас: /clan_invite"
+            )
+            return
+
     clan["members"].append(user.id)
+    if "contributions" not in clan:
+        clan["contributions"] = {}
+    clan["contributions"][str(user.id)] = clan["contributions"].get(str(user.id), 0)
+    if user.id in clan.get("invites", []):
+        clan["invites"].remove(user.id)
     save_clans(clans)
     set_user_clan_id(user.id, clan_id)
     await update.message.reply_text(
@@ -3196,10 +4691,13 @@ async def clan_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     update_coins(user.id, -amount)
     clan["treasury"] = clan.get("treasury", 0) + amount
+    if "contributions" not in clan:
+        clan["contributions"] = {}
+    clan["contributions"][str(user.id)] = clan["contributions"].get(str(user.id), 0) + amount
     save_clans(clans)
 
     rank = get_clan_rank(clan["id"])
-    bonus = CLAN_BUFF_TIERS.get(rank, 0)
+    bonus = get_clan_buff_bonus_percent(clan["id"])
     text = (
         f"✅ Вы внесли {_fmt_coins(amount)} монет в казну клана «{clan['name']}».\n"
         f"🏦 Казна клана: {_fmt_coins(clan['treasury'])} монет."
@@ -3246,17 +4744,21 @@ async def clan_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     rank = get_clan_rank(clan["id"])
-    bonus = CLAN_BUFF_TIERS.get(rank, 0)
+    bonus = get_clan_buff_bonus_percent(clan["id"])
     badge = _clan_rank_badge(rank)
-    owner_name = await _get_display_name(context, clan["owner"])
+    owner_name = html.escape(await _get_display_name(context, clan["owner"]))
     members = clan.get("members", [])
+    clan_type = "🔓 Открытый" if clan.get("type", "open") == "open" else "🔒 Закрытый"
+    upgrade_lvl = clan.get("buff_upgrade_level", 0)
 
     lines = [
         f"🏰 <b>{html.escape(clan['name'])}</b>",
         f"🆔 ID клана: {clan['id']}",
         f"👑 Владелец: {owner_name}",
+        f"🔐 Тип: {clan_type}",
         f"👥 Участников: {len(members)}",
         f"🏦 Казна: {_fmt_coins(clan.get('treasury', 0))} монет",
+        f"⬆️ Прокачка баффа: ур. {upgrade_lvl}",
         f"📊 Место в рейтинге: {badge}" + (f" (из {len(get_ranked_clans())} в зачёте)" if rank else " (нет в зачёте — казна пуста)"),
     ]
     if bonus:
@@ -3264,6 +4766,180 @@ async def clan_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         lines.append(f"\nℹ️ Бафф получают кланы в топ-3 по казне: {', '.join(f'{_clan_rank_badge(r)} +{p}%' for r, p in sorted(CLAN_BUFF_TIERS.items()))}.")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def clan_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    clan_id = get_user_clan_id(user.id)
+    if not clan_id:
+        await update.message.reply_text("❌ Вы не в клане.")
+        return
+    clan = get_clan_by_id(clan_id)
+    if not clan or clan["owner"] != user.id:
+        await update.message.reply_text("❌ Только создатель клана может просматривать вклады.")
+        return
+    contributions = clan.get("contributions", {})
+    lines = [f"👥 <b>Участники клана «{html.escape(clan['name'])}»</b>\n"]
+    member_data = []
+    for mid in clan.get("members", []):
+        contrib = contributions.get(str(mid), 0)
+        name = html.escape(await _get_display_name(context, mid))
+        member_data.append((mid, name, contrib))
+    member_data.sort(key=lambda x: x[2], reverse=True)
+    for i, (mid, name, contrib) in enumerate(member_data, 1):
+        crown = " 👑" if mid == clan["owner"] else ""
+        lines.append(f"{i}. {name}{crown} — 🏦 {_fmt_coins(contrib)} монет (ID: {mid})")
+    lines.append(f"\n/clan_kick {html.escape('<user_id>')} — исключить | /clan_type — сменить тип")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def clan_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    clan_id = get_user_clan_id(user.id)
+    if not clan_id:
+        await update.message.reply_text("❌ Вы не в клане.")
+        return
+    clan = get_clan_by_id(clan_id)
+    if not clan or clan["owner"] != user.id:
+        await update.message.reply_text("❌ Только создатель может исключать участников.")
+        return
+    if not context.args:
+        await update.message.reply_text("ℹ️ /clan_kick <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID.")
+        return
+    if target_id == user.id:
+        await update.message.reply_text("❌ Нельзя исключить себя. Используйте /leave_clan.")
+        return
+    if target_id not in clan.get("members", []):
+        await update.message.reply_text("❌ Этот игрок не в вашем клане.")
+        return
+    clan["members"].remove(target_id)
+    clans = load_clans()
+    for i, c in enumerate(clans):
+        if c["id"] == clan_id:
+            clans[i] = clan
+            break
+    save_clans(clans)
+    set_user_clan_id(target_id, None)
+    await update.message.reply_text(f"✅ Игрок {target_id} исключён из клана.")
+    try:
+        await context.bot.send_message(target_id, f"ℹ️ Вас исключили из клана «{clan['name']}».")
+    except Exception:
+        pass
+
+async def clan_type_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    clan_id = get_user_clan_id(user.id)
+    if not clan_id:
+        await update.message.reply_text("❌ Вы не в клане.")
+        return
+    clan = get_clan_by_id(clan_id)
+    if not clan or clan["owner"] != user.id:
+        await update.message.reply_text("❌ Только создатель может менять тип клана.")
+        return
+    if not context.args or context.args[0].lower() not in ("open", "closed"):
+        current = "открытый" if clan.get("type", "open") == "open" else "закрытый"
+        await update.message.reply_text(
+            f"ℹ️ Текущий тип: {current}\n"
+            "Использование: /clan_type open — любой может вступить\n"
+            "/clan_type closed — только по приглашению"
+        )
+        return
+    new_type = context.args[0].lower()
+    clan["type"] = new_type
+    clans = load_clans()
+    for i, c in enumerate(clans):
+        if c["id"] == clan_id:
+            clans[i] = clan
+            break
+    save_clans(clans)
+    label = "🔓 открытым" if new_type == "open" else "🔒 закрытым"
+    await update.message.reply_text(f"✅ Клан теперь {label}.")
+
+async def clan_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    clan_id = get_user_clan_id(user.id)
+    if not clan_id:
+        await update.message.reply_text("❌ Вы не в клане.")
+        return
+    clan = get_clan_by_id(clan_id)
+    if not clan or clan["owner"] != user.id:
+        await update.message.reply_text("❌ Только создатель может приглашать.")
+        return
+    if not context.args:
+        await update.message.reply_text("ℹ️ /clan_invite <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID.")
+        return
+    if get_user_clan_id(target_id):
+        await update.message.reply_text("❌ Игрок уже состоит в клане.")
+        return
+    if "invites" not in clan:
+        clan["invites"] = []
+    if target_id not in clan["invites"]:
+        clan["invites"].append(target_id)
+    clans = load_clans()
+    for i, c in enumerate(clans):
+        if c["id"] == clan_id:
+            clans[i] = clan
+            break
+    save_clans(clans)
+    await update.message.reply_text(f"✅ Игрок {target_id} приглашён в клан.")
+    try:
+        await context.bot.send_message(
+            target_id,
+            f"📨 Вас пригласили в клан «{clan['name']}»!\n/join_clan {clan_id}",
+        )
+    except Exception:
+        pass
+
+async def clan_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    clan_id = get_user_clan_id(user.id)
+    if not clan_id:
+        await update.message.reply_text("❌ Вы не в клане.")
+        return
+    clan = get_clan_by_id(clan_id)
+    if not clan:
+        await update.message.reply_text("❌ Клан не найден.")
+        return
+    if user.id not in clan.get("members", []):
+        await update.message.reply_text("❌ Вы не участник этого клана.")
+        return
+    level = clan.get("buff_upgrade_level", 0)
+    next_level = level + 1
+    cost = CLAN_UPGRADE_COSTS.get(next_level)
+    if not cost:
+        await update.message.reply_text(f"❌ Максимальный уровень прокачки ({level}) достигнут.")
+        return
+    if clan.get("treasury", 0) < cost:
+        await update.message.reply_text(
+            f"❌ Нужно {_fmt_coins(cost)} монет в казне. Сейчас: {_fmt_coins(clan.get('treasury', 0))}."
+        )
+        return
+    clan["treasury"] -= cost
+    clan["buff_upgrade_level"] = next_level
+    clans = load_clans()
+    for i, c in enumerate(clans):
+        if c["id"] == clan_id:
+            clans[i] = clan
+            break
+    save_clans(clans)
+    rank = get_clan_rank(clan_id)
+    bonus = get_clan_buff_bonus_percent(clan_id)
+    await update.message.reply_text(
+        f"⬆️ <b>Бафф клана прокачан до ур. {next_level}!</b>\n"
+        f"💰 Потрачено из казны: {_fmt_coins(cost)}\n"
+        f"🏦 Остаток казны: {_fmt_coins(clan['treasury'])}\n"
+        f"🌟 Текущий бонус: +{bonus}% к монетам"
+        + (f" (место {_clan_rank_badge(rank)})" if rank else ""),
+        parse_mode="HTML",
+    )
 
 async def clans_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     clans = load_clans()
@@ -3299,7 +4975,7 @@ def main() -> None:
         ])
 
     # Создаём файлы, если их нет
-    for f in [USERS_FILE, BLACKLIST_FILE, MODERATORS_FILE, COINS_FILE, SHOP_FILE, PROMOCODES_FILE, EVENTS_FILE, BETS_FILE, CLANS_FILE]:
+    for f in [USERS_FILE, BLACKLIST_FILE, MODERATORS_FILE, COINS_FILE, SHOP_FILE, PROMOCODES_FILE, EVENTS_FILE, BETS_FILE, CLANS_FILE, ISSUED_PROMO_CODES_FILE]:
         if not os.path.exists(f):
             if f in [BLACKLIST_FILE, MODERATORS_FILE, SHOP_FILE, EVENTS_FILE, BETS_FILE, CLANS_FILE]:
                 save_data(f, [])
@@ -3331,90 +5007,82 @@ def main() -> None:
             save_data(RARITIES_FILE, default_rarities)
             logger.warning("Файл редкостей был пуст или не содержал выпадаемых – пересоздан.")
 
-    application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(TOKEN).post_init(_post_init).build()
 
-    # ConversationHandler'ы
-    addcard_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("admin_addcard", admin_addcard)],
+    # Периодическая фоновая задача запускается через post_init, не зависит от наличия JobQueue
+
+    # ConversationHandler'ы (все многошаговые потоки в одном обработчике, чтобы не было конфликтов состояний)
+    async def _bet_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data.clear()
+        await bet_start(update, context)
+        return ConversationHandler.END
+
+    async def _trade_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data.clear()
+        await trade_offer(update, context)
+        return ConversationHandler.END
+
+    async def _events_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        context.user_data.clear()
+        await events_menu(update, context)
+        return ConversationHandler.END
+
+    all_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("admin_addcard", admin_addcard),
+            CommandHandler("admin_addrarity", admin_addrarity),
+            CommandHandler("admin_editrarity", admin_editrarity),
+            CommandHandler("admin_addshopitem", admin_addshopitem),
+            CommandHandler("admin_editcard", admin_editcard),
+            CommandHandler("craft", start_craft),
+            CommandHandler("bet", _bet_entry),
+            CommandHandler("trade", _trade_entry),
+            CommandHandler("events", _events_entry),
+            CommandHandler("rating_team", rating_team_start),
+            CommandHandler("create_promo", create_promo_start),
+            CommandHandler("start_season", start_season_cmd),
+        ],
         states={
             ADMIN_CARD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_card_name)],
             ADMIN_CARD_RARITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_card_rarity)],
             ADMIN_CARD_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_card_description)],
             ADMIN_CARD_IMAGE: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, admin_card_image)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_addcard)],
-    )
-
-    addrarity_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("admin_addrarity", admin_addrarity)],
-        states={
             ADMIN_RARITY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rarity_name)],
             ADMIN_RARITY_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rarity_emoji)],
             ADMIN_RARITY_DROPPABLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rarity_droppable)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_addrarity)],
-    )
-
-    addshopitem_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("admin_addshopitem", admin_addshopitem)],
-        states={
+            ADMIN_RARITY_CHANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_rarity_chance)],
+            ADMIN_EDIT_RARITY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_rarity_name)],
+            ADMIN_EDIT_RARITY_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_rarity_emoji)],
+            ADMIN_EDIT_RARITY_DROPPABLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_rarity_droppable)],
+            ADMIN_EDIT_RARITY_CHANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_rarity_chance)],
             ADMIN_SHOP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_shop_name)],
-            ADMIN_SHOP_TYPE: [CallbackQueryHandler(admin_shop_type)],
+            ADMIN_SHOP_TYPE: [CallbackQueryHandler(admin_shop_type, pattern=r"^(reset|pack)$")],
             ADMIN_SHOP_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_shop_price)],
             ADMIN_SHOP_CARDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_shop_cards)],
             ADMIN_SHOP_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_shop_duration)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_addshopitem)],
-    )
-
-    editcard_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("admin_editcard", admin_editcard)],
-        states={
-            EDIT_CARD_FIELD: [CallbackQueryHandler(edit_card_field)],
+            EDIT_CARD_FIELD: [CallbackQueryHandler(edit_card_field, pattern=r"^(name|rarity|description|image|cancel)$")],
             EDIT_CARD_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_card_value),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, edit_card_value)
             ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_editcard)],
-    )
-
-    craft_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("craft", start_craft)],
-        states={
             CRAFT_SELECT_CARDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_craft)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_craft)],
-    )
-
-    promo_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("create_promo", create_promo_start)],
-        states={
+            RATING_TEAM_GK: [MessageHandler(filters.TEXT & ~filters.COMMAND, rating_team_gk)],
+            RATING_TEAM_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, rating_team_field)],
             PROMO_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_name)],
             PROMO_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_type)],
             PROMO_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_value)],
             PROMO_USES: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_uses)],
             PROMO_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_duration)],
+            SEASON_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, season_number)],
+            SEASON_PRIZE_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, season_prize_1)],
+            SEASON_PRIZE_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, season_prize_2)],
+            SEASON_PRIZE_3: [MessageHandler(filters.TEXT & ~filters.COMMAND, season_prize_3)],
         },
-        fallbacks=[CommandHandler("cancel", cancel_promo)],
+        fallbacks=[CommandHandler("cancel", cancel_craft)],
+        allow_reentry=True,
     )
 
-    rating_team_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("rating_team", rating_team_start)],
-        states={
-            RATING_TEAM_GK: [MessageHandler(filters.TEXT & ~filters.COMMAND, rating_team_gk)],
-            RATING_TEAM_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, rating_team_field)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_rating_team)],
-    )
-
-    application.add_handler(addcard_conv_handler)
-    application.add_handler(addrarity_conv_handler)
-    application.add_handler(addshopitem_conv_handler)
-    application.add_handler(editcard_conv_handler)
-    application.add_handler(craft_conv_handler)
-    application.add_handler(promo_conv_handler)
-    application.add_handler(rating_team_conv_handler)
+    application.add_handler(all_conv_handler)
 
     # Команды
     application.add_handler(CommandHandler("start", start))
@@ -3426,6 +5094,11 @@ def main() -> None:
     application.add_handler(CommandHandler("shop", show_shop))
     application.add_handler(CommandHandler("buy", buy_item))
     application.add_handler(CommandHandler("leaderboard", show_leaderboard))
+    application.add_handler(CommandHandler("work", work_command))
+    application.add_handler(CommandHandler("market", show_market))
+    application.add_handler(CommandHandler("sell", sell_card))
+    application.add_handler(CommandHandler("my_listings", my_listings))
+    application.add_handler(CommandHandler("unlist", unlist_card))
     application.add_handler(CommandHandler("admin_listcards", admin_listcards))
     application.add_handler(CommandHandler("admin_deletecard", admin_deletecard))
     application.add_handler(CommandHandler("admin_resettimer", admin_resettimer))
@@ -3446,10 +5119,8 @@ def main() -> None:
     application.add_handler(CommandHandler("upgrade_buff", upgrade_buff))
     application.add_handler(CommandHandler("redeem", redeem_promo))
     application.add_handler(CommandHandler("profile", profile))
-    application.add_handler(CommandHandler("givecard", givecard))
     application.add_handler(CommandHandler("create_match", create_match))
     application.add_handler(CommandHandler("finish_match", finish_match))
-    application.add_handler(CommandHandler("bet", bet_start))
     application.add_handler(CommandHandler("my_bets", my_bets))
     application.add_handler(CommandHandler("find_match", find_match))
     application.add_handler(CommandHandler("rating", rating_profile))
@@ -3459,6 +5130,13 @@ def main() -> None:
     application.add_handler(CommandHandler("clan_deposit", clan_deposit))
     application.add_handler(CommandHandler("clan_info", clan_info))
     application.add_handler(CommandHandler("clans", clans_leaderboard))
+    application.add_handler(CommandHandler("clan_members", clan_members))
+    application.add_handler(CommandHandler("clan_kick", clan_kick))
+    application.add_handler(CommandHandler("kick", clan_kick))
+    application.add_handler(CommandHandler("clan_type", clan_type_cmd))
+    application.add_handler(CommandHandler("clan_invite", clan_invite))
+    application.add_handler(CommandHandler("clan_upgrade", clan_upgrade))
+    application.add_handler(CommandHandler("end_season", end_season_cmd))
 
     # CallbackQueryHandler'ы
     application.add_handler(CallbackQueryHandler(admin_shop_type, pattern=r"^(reset|pack)"))
@@ -3466,14 +5144,22 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(upgrade_buff_buttons, pattern=r"^(confirm_upgrade_buff|cancel_upgrade_buff)"))
     application.add_handler(CallbackQueryHandler(bet_match_callback, pattern=r"^bet_match_"))
     application.add_handler(CallbackQueryHandler(bet_outcome_callback, pattern=r"^bet_outcome_"))
+    application.add_handler(CallbackQueryHandler(trade_callbacks, pattern=r"^trade_"))
+    application.add_handler(CallbackQueryHandler(market_buy_callback, pattern=r"^market_buy_"))
+    application.add_handler(CallbackQueryHandler(market_page_callback, pattern=r"^market_page_"))
+    application.add_handler(CallbackQueryHandler(events_callbacks, pattern=r"^evt_"))
 
-    # MessageHandler для ввода суммы ставки
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bet_amount))
+    # Обработка обновлений голосований (ручная/автоматическая остановка)
+    application.add_handler(PollHandler(poll_update_handler))
 
-    # Проверка подписки (обрабатывает все сообщения)
+    # MessageHandler для текстового ввода (ставки, обмен, события)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input_handler))
+
+    # Проверка подписки (обрабатывает оставшиеся сообщения)
     application.add_handler(MessageHandler(filters.ALL, check_subscription))
 
-    application.run_polling()
+    # Явно запрашиваем все типы апдейтов, чтобы гарантированно получать Poll-апдейты.
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
