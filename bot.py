@@ -12,7 +12,7 @@ import io
 # Pillow нужен для картинки рейтингового состава (/rating).
 # Если не установлен (pip install Pillow) — бот работает, состав показывается текстом.
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -226,9 +226,17 @@ async def show_collection_with_ids(user_id: int) -> str:
             if card["rarity"] not in grouped:
                 grouped[card["rarity"]] = []
             grouped[card["rarity"]].append((card, card_counts[card_id]))
-    rarity_order = [r["name"] for r in rarities] + ["Легендарная", "Блещет умом", "Эпическая", "Редкая", "Обычная", "Эксклюзивная"]
-    unique_rarities = list(set(grouped.keys()))
-    sorted_rarities = sorted(unique_rarities, key=lambda r: rarity_order.index(r) if r in rarity_order else len(rarity_order))
+    # Сортировка по РЕАЛЬНОМУ шансу выпадения:
+    # невыпадающие (эксклюзивные) всегда сверху, дальше от самых редких к частым.
+    rarity_info = {r["name"]: r for r in rarities}
+    def _collection_sort_key(rarity_name):
+        info = rarity_info.get(rarity_name, {})
+        droppable = info.get("droppable", rarity_name != "Эксклюзивная")
+        chance = get_rarity_drop_chance(rarity_name)
+        if chance <= 0:
+            chance = 1.0
+        return (0 if not droppable else 1, chance, rarity_name)
+    sorted_rarities = sorted(grouped.keys(), key=_collection_sort_key)
     message = "🃏 <b>Ваша коллекция карточек</b>:\n\n"
     total_count = 0
     for rarity in sorted_rarities:
@@ -357,7 +365,31 @@ RARITY_POWER = {
 DEFAULT_CARD_POWER = 40
 
 def get_card_power(card: dict) -> int:
-    return RARITY_POWER.get(card.get("rarity"), DEFAULT_CARD_POWER)
+    rarity = card.get("rarity")
+    if rarity in RARITY_POWER:
+        return RARITY_POWER[rarity]
+    # Кастомные редкости: сила вычисляется по шансу выпадения: чем реже - тем сильнее.
+    try:
+        chance = get_rarity_drop_chance(rarity)
+    except Exception:
+        chance = 0.0
+    if chance <= 0:
+        return 105  # невыпадающие (эксклюзивного уровня)
+    if chance <= 0.02:
+        return 105
+    if chance <= 0.05:
+        return 100
+    if chance <= 0.08:
+        return 95   # Мифическая (6%)
+    if chance <= 0.12:
+        return 85
+    if chance <= 0.20:
+        return 70
+    if chance <= 0.30:
+        return 55   # Сверхредкая (25%)
+    if chance <= 0.40:
+        return 45
+    return 35
 
 def get_rating_elo(user_id: int) -> int:
     users = load_data(USERS_FILE, {})
@@ -382,7 +414,40 @@ RARITY_FRAME_COLORS = {
     "Легендарная": ((255, 190, 30), (255, 235, 140)),
     "Блещет умом": ((0, 210, 190), (150, 255, 240)),
     "Эксклюзивная": ((255, 55, 90), (255, 155, 175)),
+    "Мифическая": ((255, 60, 185), (255, 170, 230)),
+    "Сверхредкая": ((40, 205, 120), (160, 255, 210)),
 }
+
+# Палитра для ЛЮБЫХ будущих кастомных редкостей:
+# цвет стабильно выбирается по имени — больше никаких серых дефолтов.
+_CUSTOM_FRAME_PALETTE = [
+    ((255, 120, 40), (255, 190, 140)),   # оранжевый
+    ((240, 80, 255), (250, 175, 255)),   # неоново-розовый
+    ((120, 220, 40), (200, 255, 150)),   # лаймовый
+    ((80, 120, 255), (170, 195, 255)),   # индиго
+    ((25, 220, 255), (170, 245, 255)),   # неоново-голубой
+    ((255, 210, 0), (255, 240, 150)),    # янтарный
+]
+
+def _rarity_frame_colors(rarity_name: str):
+    """Цвет рамки для редкости. Неизвестные получают яркий цвет из палитры."""
+    if rarity_name in RARITY_FRAME_COLORS:
+        return RARITY_FRAME_COLORS[rarity_name]
+    idx = sum(ord(ch) for ch in str(rarity_name)) % len(_CUSTOM_FRAME_PALETTE)
+    return _CUSTOM_FRAME_PALETTE[idx]
+
+def _is_premium_rarity(rarity_name: str) -> bool:
+    """Топ-редкости получают свечение и звёзды на рамке.
+
+    Это легендарные-и-выше ПЛЮС любая кастомная редкость с шансом <= 8%
+    (Мифическая и т.п. автоматически считаются крутыми)."""
+    if is_legendary_or_higher(rarity_name):
+        return True
+    try:
+        chance = get_rarity_drop_chance(rarity_name)
+    except Exception:
+        return False
+    return 0 < chance <= 0.08
 
 def get_framed_card_photo(card: dict):
     """Картинка карточки с рамкой по редкости (файл) или None.
@@ -400,12 +465,15 @@ def get_framed_card_photo(card: dict):
         # Ключ кэша: id + имя + редкость + время изменения исходника.
         # Если админ заменит фото/название/редкость — рамка перерисуется сама.
         mtime = int(os.path.getmtime(src_path))
-        cache_key = f"{card['id']}_{abs(hash((card.get('name'), card['rarity'], mtime))) % 10**10}.png"
+        # Стабильный ключ (без hash(), который меняется при каждом рестарте бота):
+        # кэш теперь переживает перезапуски и не перерисовывается зря.
+        name_sig = sum(ord(ch) for ch in (str(card.get('name', '')) + str(card['rarity']))) % 100000
+        cache_key = f"{card['id']}_{mtime}_{name_sig}.png"
         cache_path = os.path.join(FRAMED_CARDS_DIR, cache_key)
         if os.path.exists(cache_path):
             return open(cache_path, "rb")
 
-        main, light = RARITY_FRAME_COLORS.get(card["rarity"], RARITY_FRAME_COLORS["Обычная"])
+        main, light = _rarity_frame_colors(card["rarity"])
         img = Image.open(src_path).convert("RGB")
         target_w = 512
         target_h = max(1, int(img.height * target_w / max(1, img.width)))
@@ -418,7 +486,7 @@ def get_framed_card_photo(card: dict):
         canvas = Image.new("RGB", (width, height), (16, 20, 30))
         draw = ImageDraw.Draw(canvas)
 
-        legendary = is_legendary_or_higher(card["rarity"])
+        legendary = _is_premium_rarity(card["rarity"])
         # "Свечение" для легендарных и выше: несколько рамок от тёмного к светлому
         if legendary:
             glow = (tuple(c // 3 for c in main), tuple(c // 2 for c in main), main)
@@ -755,7 +823,7 @@ USER_COMMANDS_TEXT = (
     "/craft - улучшить карточки\n"
     "/leaderboard - таблица лидеров\n"
     "/casino <сумма> - сыграть в казино\n"
-    "/coin <орел|решка> <сумма> - подбросить монетку\n"
+    "/coin <орел|решка> <сумма> - подбросить монетку (макс. 300, рискованно!)\n"
     "/slots <сумма> - игровые автоматы \U0001F3B0\n"
     "/keyboard - включить удобную клавиатуру\n"
     "/hide - скрыть клавиатуру\n"
@@ -766,9 +834,10 @@ USER_COMMANDS_TEXT = (
     "/profile - ваш профиль\n"
     "/bet - сделать ставку (инлайн-меню)\n"
     "/my_bets - мои ставки\n"
-    "/daily - забрать ежедневную награду\n"
+    "/daily - ежедневная награда (серия дней даёт до +100%)\n"
     "/rating_team - собрать состав для рейтингового режима\n"
     "/find_match - найти соперника (рейтинговый режим)\n"
+    "/duel <ставка> - дуэль карточек 1 на 1 на монеты\n"
     "/rating - мой рейтинг и текущий состав\n\n"
     "🏰 Кланы:\n"
     "/create_clan <название> - создать клан (1000 монет)\n"
@@ -1025,6 +1094,18 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🧠 💡 Она блещет умом...",
             "🧠 🎓 Гениально! Открываем!",
         ],
+        "Мифическая": [
+            "🃏 Тянем карточку из колоды...",
+            "🃏 🌫 Колоду окутывает туман...",
+            "😳 ⚡ Карта из древних МИФОВ...",
+            "😳 🌌 Она светится магией...",
+            "😳 🔮 МИФИЧЕСКАЯ! Открываем!",
+        ],
+        "Сверхредкая": [
+            "🃏 Тянем карточку из колоды...",
+            "🕶 Карта в тёмных очках...",
+            "🕶 😏 Сверхредкая! Открываем!",
+        ],
         "Эпическая": [
             "🃏 Тянем карточку из колоды...",
             "💎 Карта отливает синим...",
@@ -1039,7 +1120,26 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🃏 Открываем!",
         ],
     }
-    frames = RARITY_ANIMATIONS.get(card["rarity"], RARITY_ANIMATIONS["Обычная"])
+    frames = RARITY_ANIMATIONS.get(card["rarity"])
+    if frames is None:
+        # Кастомная редкость без своей анимации:
+        # собираем её автоматически по шансу выпадения и её смайлику.
+        emoji = get_rarity_emoji(card["rarity"])
+        chance = get_rarity_drop_chance(card["rarity"])
+        if 0 < chance <= 0.08:
+            frames = [
+                "🃏 Тянем карточку из колоды...",
+                f"{emoji} ✨ Карта светится...",
+                f"{emoji} 💫 Она ОЧЕНЬ редкая...",
+                f"{emoji} 🎆 Невероятно! Открываем!",
+            ]
+        elif 0 < chance <= 0.2:
+            frames = [
+                "🃏 Тянем карточку из колоды...",
+                f"{emoji} ✨ Отличный улов! Открываем!",
+            ]
+        else:
+            frames = RARITY_ANIMATIONS["Обычная"]
     try:
         anim_msg = await update.message.reply_text(frames[0])
         for frame in frames[1:]:
@@ -1160,9 +1260,19 @@ async def daily_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Начисляем фиксированные монеты (бафф-карта + клан-бафф складываются)
+    # 🔥 Стрик ежедневных наград: забрал вовремя (не пропустил больше суток
+    # после отката) — серия растёт. Каждый день серии даёт +10% к награде (до +100%).
+    daily_streak = user_data.get("daily_streak", 0)
+    if last_daily > 0 and elapsed < DAILY_COOLDOWN_SECONDS * 2:
+        daily_streak += 1
+    else:
+        daily_streak = 1
+    user_data["daily_streak"] = daily_streak
+    streak_bonus = min((daily_streak - 1) * 0.10, 1.0)
+
+    # Начисляем фиксированные монеты (бафф-карта + клан-бафф складываются, стрик — сверху)
     total_multiplier = get_total_coin_multiplier(user.id)
-    daily_amount = int(DAILY_COINS_AMOUNT * total_multiplier)
+    daily_amount = int(DAILY_COINS_AMOUNT * total_multiplier * (1.0 + streak_bonus))
     new_balance = update_coins(user.id, daily_amount)
 
     # Обновляем дату последнего получения
@@ -1178,6 +1288,10 @@ async def daily_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if total_multiplier > 1.0:
         bonus_percent = round((total_multiplier - 1.0) * 100)
         message += f"🌟 Бонус баффов (карта + клан): +{bonus_percent}%\n"
+    if daily_streak > 1:
+        message += f"🔥 Серия: {daily_streak} дн. подряд (+{round(streak_bonus * 100)}% к награде, максимум +100%)\n"
+    else:
+        message += "🔥 Забирай награду каждый день — серия даёт до +100% монет!\n"
 
     # Шанс дополнительно получить случайную карточку
     if random.random() < DAILY_CARD_CHANCE:
@@ -2517,6 +2631,16 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 # ============================ МОНЕТКА ============================
+# ============================ МОНЕТКА: НАСТРОЙКИ ============================
+# Раньше было 50/50 при выплате x2 + баффы -> матожидание в ПЛЮС игроку,
+# люди стабильно фармили тысячи монет. Теперь:
+#  - базовый шанс победы 35% (было 50%)
+#  - каждая победа в серии режет шанс ещё на 7% (было 5%)
+#  - ставка ограничена COINFLIP_MAX_BET
+# Итог: монетка теперь сливает монеты из экономики, а не печатает их.
+COINFLIP_BASE_WIN_CHANCE = 0.35
+COINFLIP_MAX_BET = 300
+
 async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if is_banned(user.id):
@@ -2526,7 +2650,11 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
         return
     if len(context.args) < 2:
-        await update.message.reply_text("ℹ️ Использование: /coin <орел|решка> <сумма>")
+        await update.message.reply_text(
+            "ℹ️ Использование: /coin <орел|решка> <сумма>\n\n"
+            f"⚠️ Максимальная ставка: {COINFLIP_MAX_BET} монет.\n"
+            "🪙 Монетка хитрая: победить непросто, а серия побед снижает шанс ещё сильнее."
+        )
         return
     choice = context.args[0].lower()
     if choice not in ["орел", "решка"]:
@@ -2538,6 +2666,9 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             raise ValueError
     except ValueError:
         await update.message.reply_text("❌ Введите положительное число.")
+        return
+    if bet > COINFLIP_MAX_BET:
+        await update.message.reply_text(f"❌ Максимальная ставка в монетке: {COINFLIP_MAX_BET} монет.")
         return
     balance = get_coins(user.id)
     if balance < bet:
@@ -2554,7 +2685,7 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML"
         )
         return
-    win_chance = max(0.1, 0.5 - streak * 0.05)
+    win_chance = max(0.05, COINFLIP_BASE_WIN_CHANCE - streak * 0.07)
     if random.random() < win_chance:
         result = choice
         set_coin_streak(user.id, streak + 1)
@@ -4725,8 +4856,18 @@ def _load_team_font(size: int):
     except Exception:
         return ImageFont.load_default()
 
+def _draw_vertical_gradient(img, top_color, bottom_color):
+    """Вертикальный градиент фона (1px колонка, растянутая на всю ширину)."""
+    w, h = img.size
+    col = Image.new("RGB", (1, h))
+    for y in range(h):
+        t = y / max(1, h - 1)
+        col.putpixel((0, y), tuple(int(a + (b - a) * t) for a, b in zip(top_color, bottom_color)))
+    img.paste(col.resize((w, h)))
+
 def build_rating_team_image(user_id: int):
-    """Собирает красивую картинку рейтингового состава (PNG в памяти).
+    """Красивая картинка рейтингового состава: градиентный фон,
+    рамки в цвет редкости карт, бейджи ролей, центрированные подписи.
 
     Возвращает BytesIO или None (нет Pillow / нет состава) — тогда показываем текст."""
     if not PIL_AVAILABLE:
@@ -4740,43 +4881,110 @@ def build_rating_team_image(user_id: int):
     for fid in team["field"]:
         members.append(("ПОЛЕВОЙ", card_map.get(fid)))
 
-    CARD_W, CARD_H, GAP, PAD, TOP = 220, 300, 24, 36, 120
+    CARD_W, CARD_H, GAP, PAD, TOP = 240, 336, 30, 48, 172
     width = PAD * 2 + len(members) * CARD_W + (len(members) - 1) * GAP
-    height = TOP + CARD_H + 116
-    img = Image.new("RGB", (width, height), (13, 22, 38))
+    height = TOP + CARD_H + 150
+    img = Image.new("RGB", (width, height))
+    _draw_vertical_gradient(img, (26, 36, 66), (7, 9, 18))
     draw = ImageDraw.Draw(img)
-    font_title = _load_team_font(44)
-    font_role = _load_team_font(22)
-    font_name = _load_team_font(24)
-    font_small = _load_team_font(20)
+    font_title = _load_team_font(52)
+    font_sub = _load_team_font(26)
+    font_role = _load_team_font(20)
+    font_name = _load_team_font(26)
+    font_small = _load_team_font(22)
 
+    gold = (255, 212, 84)
+    # Заголовок по центру + декоративные линии по бокам
+    title = "РЕЙТИНГОВЫЙ СОСТАВ"
+    try:
+        tw = draw.textlength(title, font=font_title)
+    except Exception:
+        tw = 0
+    tx = max(PAD, (width - tw) / 2)
+    draw.text((tx, 32), title, font=font_title, fill=gold)
+    for x1, x2 in ((PAD, tx - 28), (tx + tw + 28, width - PAD)):
+        if x2 > x1:
+            draw.line([x1, 60, x2, 60], fill=(150, 125, 55), width=3)
+            draw.line([x1, 67, x2, 67], fill=(80, 68, 38), width=1)
     elo = get_rating_elo(user_id)
     strength = int(_team_strength(team, card_map))
-    draw.text((PAD, 28), "РЕЙТИНГОВЫЙ СОСТАВ", font=font_title, fill=(255, 214, 90))
-    draw.text((PAD, 82), f"Рейтинг: {elo}   Сила состава: {strength}", font=font_small, fill=(150, 200, 255))
+    sub = f"Рейтинг: {elo}      Сила состава: {strength}"
+    try:
+        sw = draw.textlength(sub, font=font_sub)
+    except Exception:
+        sw = 0
+    draw.text((max(PAD, (width - sw) / 2), 96), sub, font=font_sub, fill=(165, 205, 255))
 
     for i, (role, card) in enumerate(members):
         x = PAD + i * (CARD_W + GAP)
-        border = (255, 200, 60) if role == "ВРАТАРЬ" else (90, 150, 255)
-        draw.rectangle([x - 4, TOP - 4, x + CARD_W + 4, TOP + CARD_H + 4], outline=border, width=4)
+        rarity = card.get("rarity", "") if card else ""
+        if rarity:
+            main, light = _rarity_frame_colors(rarity)
+        else:
+            main, light = (110, 125, 150), (170, 185, 210)
+        role_color = (255, 200, 60) if role == "ВРАТАРЬ" else (110, 165, 255)
+        # Свечение для топ-редкостей
+        if rarity and _is_premium_rarity(rarity):
+            for g, col in enumerate((tuple(c // 3 for c in main), tuple(c // 2 for c in main))):
+                off = 13 - g * 4
+                draw.rectangle([x - off, TOP - off, x + CARD_W + off, TOP + CARD_H + off], outline=col, width=4)
+        # Рамка в цвет редкости карты + светлая линия
+        draw.rectangle([x - 5, TOP - 5, x + CARD_W + 5, TOP + CARD_H + 5], outline=main, width=5)
+        draw.rectangle([x - 1, TOP - 1, x + CARD_W + 1, TOP + CARD_H + 1], outline=light, width=1)
         card_img = None
         if card:
             path = os.path.join(CARDS_IMAGE_DIR, card.get("image", ""))
             if os.path.exists(path):
                 try:
-                    card_img = Image.open(path).convert("RGB").resize((CARD_W, CARD_H))
+                    # Центр-кроп без искажения пропорций (раньше картинки плющило)
+                    card_img = ImageOps.fit(Image.open(path).convert("RGB"), (CARD_W, CARD_H))
                 except Exception:
                     card_img = None
         if card_img:
             img.paste(card_img, (x, TOP))
         else:
             draw.rectangle([x, TOP, x + CARD_W, TOP + CARD_H], fill=(30, 45, 70))
-            draw.text((x + 48, TOP + CARD_H // 2 - 12), "НЕТ ФОТО", font=font_role, fill=(120, 140, 170))
-        draw.text((x, TOP + CARD_H + 12), role, font=font_role, fill=border)
-        name = (card.get("name", "?") if card else "?")[:18]
-        draw.text((x, TOP + CARD_H + 42), name, font=font_name, fill=(235, 240, 250))
-        power = get_card_power(card or {})
-        draw.text((x, TOP + CARD_H + 74), f"Сила: {power}", font=font_small, fill=(150, 200, 255))
+            nf = "НЕТ ФОТО"
+            try:
+                nfw = draw.textlength(nf, font=font_role)
+            except Exception:
+                nfw = 0
+            draw.text((x + max(0, (CARD_W - nfw) / 2), TOP + CARD_H // 2 - 12), nf, font=font_role, fill=(120, 140, 170))
+        # Бейдж роли над карточкой
+        try:
+            rw = draw.textlength(role, font=font_role)
+        except Exception:
+            rw = 60
+        bw = rw + 30
+        bx = x + (CARD_W - bw) / 2
+        by = TOP - 36
+        try:
+            draw.rounded_rectangle([bx, by, bx + bw, by + 27], radius=13, fill=(5, 8, 16), outline=role_color, width=2)
+        except Exception:
+            draw.rectangle([bx, by, bx + bw, by + 27], fill=(5, 8, 16), outline=role_color)
+        draw.text((bx + 15, by + 4), role, font=font_role, fill=role_color)
+        # Имя, сила и редкость — по центру под карточкой
+        name = card.get("name", "?") if card else "?"
+        if len(name) > 16:
+            name = name[:15] + "..."
+        try:
+            nw = draw.textlength(name, font=font_name)
+        except Exception:
+            nw = 0
+        draw.text((x + max(0, (CARD_W - nw) / 2), TOP + CARD_H + 16), name, font=font_name, fill=(238, 242, 250))
+        power_text = f"Сила: {get_card_power(card or {})}"
+        try:
+            pw = draw.textlength(power_text, font=font_small)
+        except Exception:
+            pw = 0
+        draw.text((x + max(0, (CARD_W - pw) / 2), TOP + CARD_H + 52), power_text, font=font_small, fill=main)
+        if rarity:
+            rtext = str(rarity).upper()
+            try:
+                rtw = draw.textlength(rtext, font=font_role)
+            except Exception:
+                rtw = 0
+            draw.text((x + max(0, (CARD_W - rtw) / 2), TOP + CARD_H + 86), rtext, font=font_role, fill=(145, 155, 175))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -4925,12 +5133,16 @@ def _card_name(card_id, card_map: dict) -> str:
         return f"Игрок {card_id}"
     return html.escape(card["name"])
 
-def _generate_period_events(team_a: dict, team_b: dict, card_map: dict, name_a: str, name_b: str, p_a: float):
-    """Генерирует события одного периода. Возвращает (events_text_list, goals_a, goals_b)."""
+def _generate_period_events(team_a: dict, team_b: dict, card_map: dict, name_a: str, name_b: str, p_a: float, tempo: float = 1.0):
+    """Генерирует события одного периода. Возвращает (events_text_list, goals_a, goals_b).
+
+    tempo - "характер матча", выбирается случайно один раз на матч: в "закрытых"
+    матчах голов мало, в "перестрелках" - много. Вместе со случайным числом
+    событий и влиянием вратаря это даёт разные счета даже у одних и тех же соперников."""
     events = []
     goals_a = 0
     goals_b = 0
-    num_events = random.randint(4, 6)
+    num_events = random.randint(3, 8)
     for _ in range(num_events):
         acting_a = random.random() < p_a
         acting_team = team_a if acting_a else team_b
@@ -4939,8 +5151,14 @@ def _generate_period_events(team_a: dict, team_b: dict, card_map: dict, name_a: 
         player_name = _card_name(_pick_field_player(acting_team, card_map), card_map)
         gk_name = _card_name(defending_team["gk"], card_map)
 
+        # Шанс гола зависит от темпа матча и силы вратаря обороняющихся:
+        # топовый вратарь заметно чаще спасает свою команду.
+        gk_power = get_card_power(card_map.get(defending_team["gk"], {}))
+        gk_factor = 1.25 - min(1.15, gk_power / 110.0) * 0.5
+        goal_chance = max(0.06, min(0.5, 0.24 * tempo * gk_factor))
+
         roll = random.random()
-        if roll < 0.28:
+        if roll < goal_chance:
             event = random.choice(GOAL_EVENTS).format(team=team_name, player=player_name, gk=gk_name)
             if acting_a:
                 goals_a += 1
@@ -4964,8 +5182,10 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
 
     strength_a = _team_strength(team_a, card_map)
     strength_b = _team_strength(team_b, card_map)
-    total = strength_a + strength_b if (strength_a + strength_b) > 0 else 1
-    p_a = strength_a / total
+    # Логистическая формула: разница в силе составов (редкость карт) ощутимо
+    # влияет на шансы, но даже слабая команда сохраняет шанс на сенсацию.
+    p_a = 1.0 / (1.0 + 10 ** ((strength_b - strength_a) / 130.0))
+    p_a = max(0.12, min(0.88, p_a))
 
     name_a = html.escape(await _get_display_name(context, user_a))
     name_b = html.escape(await _get_display_name(context, user_b))
@@ -4984,9 +5204,10 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
     await send_both(f"⚔️ <b>Матч начинается: {name_a} 🆚 {name_b}</b>\nПервый период стартует прямо сейчас!")
 
     goals_a, goals_b = 0, 0
+    tempo = random.uniform(0.55, 1.75)  # характер матча: от "сухой обороны" до перестрелки
     for period in range(1, 4):
         await asyncio.sleep(4)  # небольшая пауза для динамики матча вживую
-        events, p_goals_a, p_goals_b = _generate_period_events(team_a, team_b, card_map, name_a, name_b, p_a)
+        events, p_goals_a, p_goals_b = _generate_period_events(team_a, team_b, card_map, name_a, name_b, p_a, tempo)
         goals_a += p_goals_a
         goals_b += p_goals_b
         period_text = (
@@ -4995,6 +5216,24 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
             + f"\n\n📊 Счёт после {period}-го периода: <b>{goals_a}:{goals_b}</b>"
         )
         await send_both(period_text)
+
+    # Овертайм при ничьей - до первого гола (ничьих больше нет)
+    if goals_a == goals_b:
+        await asyncio.sleep(3)
+        acting_a = random.random() < p_a
+        acting_team = team_a if acting_a else team_b
+        defending_team = team_b if acting_a else team_a
+        ot_team_name = name_a if acting_a else name_b
+        ot_player = _card_name(_pick_field_player(acting_team, card_map), card_map)
+        ot_gk = _card_name(defending_team["gk"], card_map)
+        if acting_a:
+            goals_a += 1
+        else:
+            goals_b += 1
+        ot_goal = random.choice(GOAL_EVENTS).format(team=ot_team_name, player=ot_player, gk=ot_gk)
+        await send_both(
+            f"⏱ <b>ОВЕРТАЙМ! Игра до первого гола...</b>\n\n{ot_goal}\n\n📊 Итоговый счёт: <b>{goals_a}:{goals_b}</b>"
+        )
 
     # Обновление ELO только для реальных пользователей
     elo_a = get_rating_elo(user_a)
@@ -5078,6 +5317,194 @@ async def find_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "🔍 Ищем соперника... Если никого не найдётся в течение 90 секунд, вы сыграете с ботом."
         )
         asyncio.create_task(_wait_and_fallback_to_bot(context, user.id, 90))
+
+# ============================ ДУЭЛИ 1 НА 1 ============================
+DUEL_MIN_BET = 10
+DUEL_MAX_BET = 500
+DUEL_COMMISSION = 0.10  # 10% банка сгорает (слив монет из экономики)
+DUEL_EXPIRE_SECONDS = 300
+
+def _duel_power(user_id: int):
+    """Сила игрока в дуэли: суммарная сила его топ-3 карточек.
+    Возвращает (power, [подписи карточек])."""
+    users = load_data(USERS_FILE, {})
+    user_data = users.get(str(user_id), {})
+    card_ids = list(user_data.get("cards", [])) + list(get_locked_card_ids(user_id))
+    if not card_ids:
+        return 0, []
+    all_cards = load_data(CARDS_FILE, [])
+    card_map = {c["id"]: c for c in all_cards}
+    owned = [card_map[cid] for cid in set(card_ids) if cid in card_map]
+    if not owned:
+        return 0, []
+    owned.sort(key=get_card_power, reverse=True)
+    top = owned[:3]
+    power = sum(get_card_power(c) for c in top)
+    labels = [f"{html.escape(c['name'])} - сила {get_card_power(c)}" for c in top]
+    return power, labels
+
+async def duel_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "ℹ️ Использование: /duel <ставка>\n"
+            "⚔️ Дуэль карточек: оба игрока ставят монеты, побеждает тот, чьи топ-3 карточки сильнее (+ доля удачи).\n"
+            f"💰 Ставка: от {DUEL_MIN_BET} до {DUEL_MAX_BET} монет. Комиссия с банка: {int(DUEL_COMMISSION * 100)}%."
+        )
+        return
+    try:
+        bet = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Ставка должна быть числом.")
+        return
+    if bet < DUEL_MIN_BET or bet > DUEL_MAX_BET:
+        await update.message.reply_text(f"❌ Ставка должна быть от {DUEL_MIN_BET} до {DUEL_MAX_BET} монет.")
+        return
+    if get_coins(user.id) < bet:
+        await update.message.reply_text(f"❌ Недостаточно монет. У вас: {_fmt_coins(get_coins(user.id))}.")
+        return
+    power, _labels = _duel_power(user.id)
+    if power <= 0:
+        await update.message.reply_text("❌ У вас нет карточек для дуэли. Сначала получите карточки.")
+        return
+
+    duels = context.bot_data.setdefault("duels", {})
+    duel_id = str(int(time.time() * 1000))
+    duels[duel_id] = {
+        "challenger": user.id,
+        "challenger_name": user.first_name or f"Игрок {user.id}",
+        "bet": bet,
+        "created": time.time(),
+    }
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚔️ Принять дуэль", callback_data=f"duel_accept_{duel_id}")],
+        [InlineKeyboardButton("❌ Отменить", callback_data=f"duel_cancel_{duel_id}")],
+    ])
+    await update.message.reply_text(
+        f"⚔️ <b>{html.escape(user.first_name or 'Игрок')} бросает вызов на дуэль карточек!</b>\n\n"
+        f"💰 Ставка: <b>{_fmt_coins(bet)}</b> монет с каждого\n"
+        f"🃏 Бой решают топ-3 карточки каждого игрока + немного удачи\n"
+        f"🏆 Победитель забирает банк (комиссия {int(DUEL_COMMISSION * 100)}%)\n\n"
+        f"⏳ Вызов действует {DUEL_EXPIRE_SECONDS // 60} минут.",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+async def duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data
+    duels = context.bot_data.setdefault("duels", {})
+
+    if data.startswith("duel_cancel_"):
+        duel_id = data[len("duel_cancel_"):]
+        duel = duels.get(duel_id)
+        if not duel:
+            await query.answer("Дуэль уже неактуальна.", show_alert=True)
+            return
+        if query.from_user.id != duel["challenger"]:
+            await query.answer("Отменить вызов может только его автор.", show_alert=True)
+            return
+        duels.pop(duel_id, None)
+        await query.answer()
+        try:
+            await query.edit_message_text("❌ Дуэль отменена.")
+        except Exception:
+            pass
+        return
+
+    if not data.startswith("duel_accept_"):
+        await query.answer()
+        return
+
+    duel_id = data[len("duel_accept_"):]
+    duel = duels.get(duel_id)
+    if not duel:
+        await query.answer("Дуэль уже неактуальна.", show_alert=True)
+        return
+    acceptor = query.from_user
+    challenger_id = duel["challenger"]
+    bet = duel["bet"]
+    if acceptor.id == challenger_id:
+        await query.answer("Нельзя принять собственный вызов.", show_alert=True)
+        return
+    if is_banned(acceptor.id):
+        await query.answer("Вы заблокированы в этом боте.", show_alert=True)
+        return
+    if time.time() - duel["created"] > DUEL_EXPIRE_SECONDS:
+        duels.pop(duel_id, None)
+        await query.answer("Вызов истёк.", show_alert=True)
+        try:
+            await query.edit_message_text("⌛ Дуэль истекла - никто не принял вызов.")
+        except Exception:
+            pass
+        return
+    if get_coins(acceptor.id) < bet:
+        await query.answer(f"Недостаточно монет: нужно {bet}.", show_alert=True)
+        return
+    if get_coins(challenger_id) < bet:
+        duels.pop(duel_id, None)
+        await query.answer("У автора вызова уже не хватает монет - дуэль отменена.", show_alert=True)
+        try:
+            await query.edit_message_text("❌ Дуэль отменена: у автора вызова не хватает монет.")
+        except Exception:
+            pass
+        return
+    power_b, cards_b = _duel_power(acceptor.id)
+    if power_b <= 0:
+        await query.answer("У вас нет карточек для дуэли.", show_alert=True)
+        return
+
+    # Снимаем дуэль из списка до расчётов (защита от двойного клика)
+    duels.pop(duel_id, None)
+    await query.answer()
+
+    power_a, cards_a = _duel_power(challenger_id)
+    update_coins(challenger_id, -bet)
+    update_coins(acceptor.id, -bet)
+
+    name_a = html.escape(duel.get("challenger_name") or f"Игрок {challenger_id}")
+    name_b = html.escape(acceptor.first_name or f"Игрок {acceptor.id}")
+
+    try:
+        await query.edit_message_text(
+            f"⚔️ <b>{name_a} 🆚 {name_b}</b>\n\n🃏 Карточки сходятся в бою...",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await asyncio.sleep(2)
+
+    # Шанс победы - логистическая формула от разницы силы топ-3 карточек
+    p_challenger = 1.0 / (1.0 + 10 ** ((power_b - power_a) / 90.0))
+    p_challenger = max(0.15, min(0.85, p_challenger))
+    challenger_wins = random.random() < p_challenger
+    winner_id = challenger_id if challenger_wins else acceptor.id
+    winner_name = name_a if challenger_wins else name_b
+
+    pot = bet * 2
+    commission = int(pot * DUEL_COMMISSION)
+    win_amount = pot - commission
+    update_coins(winner_id, win_amount)
+
+    cards_a_text = "\n".join(f"  • {c}" for c in cards_a)
+    cards_b_text = "\n".join(f"  • {c}" for c in cards_b)
+    result_text = (
+        f"⚔️ <b>Дуэль: {name_a} 🆚 {name_b}</b>\n\n"
+        f"🃏 <b>{name_a}</b> (сила {power_a}):\n{cards_a_text}\n\n"
+        f"🃏 <b>{name_b}</b> (сила {power_b}):\n{cards_b_text}\n\n"
+        f"🏆 <b>Победитель: {winner_name}!</b>\n"
+        f"💰 Выигрыш: <b>{_fmt_coins(win_amount)}</b> монет (банк {_fmt_coins(pot)}, комиссия {_fmt_coins(commission)})"
+    )
+    try:
+        await query.edit_message_text(result_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Не удалось отправить результат дуэли: {e}")
 
 # ============================ СИСТЕМА КЛАНОВ ============================
 async def create_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5697,6 +6124,7 @@ def main() -> None:
     application.add_handler(CommandHandler("finish_match", finish_match))
     application.add_handler(CommandHandler("my_bets", my_bets))
     application.add_handler(CommandHandler("find_match", find_match))
+    application.add_handler(CommandHandler("duel", duel_start))
     application.add_handler(CommandHandler("rating", rating_profile))
     application.add_handler(CommandHandler("create_clan", create_clan))
     application.add_handler(CommandHandler("join_clan", join_clan))
@@ -5717,6 +6145,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(set_buff_buttons, pattern=r"^(confirm_set_buff_|cancel_set_buff)"))
     application.add_handler(CallbackQueryHandler(upgrade_buff_buttons, pattern=r"^(confirm_upgrade_buff|cancel_upgrade_buff)"))
     application.add_handler(CallbackQueryHandler(bet_match_callback, pattern=r"^bet_match_"))
+    application.add_handler(CallbackQueryHandler(duel_callback, pattern=r"^duel_"))
     application.add_handler(CallbackQueryHandler(bet_outcome_callback, pattern=r"^bet_outcome_"))
     application.add_handler(CallbackQueryHandler(trade_callbacks, pattern=r"^trade_"))
     application.add_handler(CallbackQueryHandler(market_buy_callback, pattern=r"^market_buy_"))
