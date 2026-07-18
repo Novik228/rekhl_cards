@@ -58,12 +58,16 @@ SEASON_FILE = "season.json"
 CHANNEL_EVENTS_FILE = "channel_events.json"
 DROP_BOOSTS_FILE = "drop_boosts.json"
 ISSUED_PROMO_CODES_FILE = "issued_promo_ids.json"
+REFERRALS_FILE = "referrals.json"
+MARKET_MAX_PRICE = 100_000
+REFERRAL_REWARD = 50
+REFERRAL_MIN_ACCOUNT_AGE_SECONDS = 600
 CARDS_IMAGE_DIR = "cards_images"
 
 # ============================ СИСТЕМА КЛАНОВ ============================
 CLAN_CREATE_COST = 1000          # стоимость создания клана
 CLAN_BUFF_TIERS = {1: 8, 2: 5, 3: 3}  # % бонуса к монетам по месту клана в рейтинге казны (1 - самый большой)
-CLAN_UPGRADE_COSTS = {1: 500, 2: 1000, 3: 2000, 4: 3500, 5: 5000}
+CLAN_UPGRADE_COSTS = {1: 500, 2: 1000, 3: 2000, 4: 3500, 5: 5000, 6: 7500, 7: 10500, 8: 14000, 9: 18000, 10: 23000}
 CLAN_UPGRADE_BONUS_PER_LEVEL = 2   # +2% к клан-баффу за каждый уровень прокачки
 
 # ============================ РЕДКОСТИ: ДЕФОЛТНЫЕ ШАНСЫ ============================
@@ -135,8 +139,14 @@ def load_data(filename, default=None):
         return default
 
 def save_data(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
+    """Crash-safe JSON write: readers see either the old complete file or the new one."""
+    directory = os.path.dirname(os.path.abspath(filename)) or "."
+    tmp_name = os.path.join(directory, f".{os.path.basename(filename)}.tmp")
+    with open(tmp_name, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_name, filename)
 
 def _next_promo_id(prefix: str) -> int:
     issued = load_data(ISSUED_PROMO_CODES_FILE, {})
@@ -306,10 +316,24 @@ def set_coin_streak(user_id: int, streak: int):
     save_data(USERS_FILE, users)
 
 # ============================ БАФФЫ ============================
+MAX_BUFF_LEVEL = 10  # prevents unbounded multipliers and coin inflation
+
 def get_active_buff(user_id: int):
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user_id), {})
-    return user_data.get("buff_card", None)
+    buff = user_data.get("buff_card")
+    # A buff cannot survive selling/losing its last source card.
+    if buff and user_data.get("cards", []).count(buff.get("card_id")) < 1:
+        user_data.pop("buff_card", None)
+        users[str(user_id)] = user_data
+        save_data(USERS_FILE, users)
+        return None
+    if buff and int(buff.get("level", 1)) > MAX_BUFF_LEVEL:
+        buff["level"] = MAX_BUFF_LEVEL
+        user_data["buff_card"] = buff
+        users[str(user_id)] = user_data
+        save_data(USERS_FILE, users)
+    return buff
 
 def set_active_buff(user_id: int, card_id: int):
     users = load_data(USERS_FILE, {})
@@ -346,7 +370,7 @@ def get_coin_bonus_multiplier(user_id: int) -> float:
     buff = get_active_buff(user_id)
     if not buff:
         return 1.0
-    level = buff["level"]
+    level = min(int(buff.get("level", 1)), MAX_BUFF_LEVEL)
     bonus = level * 5
     return 1.0 + bonus / 100.0
 
@@ -775,6 +799,9 @@ def remove_one_card(user_id: int, card_id: int) -> bool:
     cards = user_data.get("cards", [])
     if card_id not in cards:
         return False
+    buff = user_data.get("buff_card")
+    if buff and buff.get("card_id") == card_id and cards.count(card_id) <= 1:
+        return False  # reserve the active buff's source copy
     cards.remove(card_id)
     user_data["cards"] = cards
     users[str(user_id)] = user_data
@@ -1051,6 +1078,7 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Теперь добавляем seen_card (отдельно, чтобы не перезаписать)
     add_seen_card(user.id, card["id"])
+    await finalize_referral_after_first_card(user, context)
 
     base_coins = random.randint(10, 50)
     # Все монетные баффы (карта + клан) складываются со штрафом за стак
@@ -1365,6 +1393,12 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Покупка
 async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на канал: {CHANNEL_LINK}")
+        return
     if not context.args:
         await update.message.reply_text("ℹ️ Использование: /buy <ID товара>")
         return
@@ -2254,6 +2288,7 @@ async def admin_shop_duration(update: Update, context: ContextTypes.DEFAULT_TYPE
         context, update.effective_user.id,
         f"Добавил товар в магазин: {new_item['name']} (ID: {new_id}, цена: {new_item['price']})"
     )
+    await post_to_channel(context, f"🛒 <b>Новинка в магазине!</b>\n\n<b>{html.escape(new_item['name'])}</b>\n💰 Цена: {_fmt_coins(new_item['price'])} монет\n📦 Тип: {'Сброс таймера' if new_item['type'] == 'reset' else 'Набор карточек'}\n\nОткрыть магазин: /shop")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -2445,6 +2480,9 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user_cards = user_data.get("cards", [])
     cards_data = load_data(CARDS_FILE, [])
     selected_cards = [c for c in cards_data if c["id"] in card_ids]
+    if len(selected_cards) != len(set(card_ids)):
+        await update.message.reply_text("❌ Одна или несколько карточек больше не существуют в базе. Карты не были списаны.")
+        return CRAFT_SELECT_CARDS
     rarities = set(card["rarity"] for card in selected_cards)
     if len(rarities) != 1:
         await update.message.reply_text("❌ Все карточки должны быть одинаковой редкости!")
@@ -2938,7 +2976,10 @@ async def upgrade_buff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("❌ У вас нет активной карты баффа. Выберите с помощью /set_buff")
         return
     card_id = buff["card_id"]
-    current_level = buff["level"]
+    current_level = int(buff.get("level", 1))
+    if current_level >= MAX_BUFF_LEVEL:
+        await update.message.reply_text(f"✅ Достигнут максимальный уровень баффа ({MAX_BUFF_LEVEL}).")
+        return
     required_cards = current_level + 1
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user.id), {})
@@ -2979,7 +3020,10 @@ async def upgrade_buff_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text("❌ У вас больше нет активной карты баффа.")
             return
         card_id = buff["card_id"]
-        current_level = buff["level"]
+        current_level = int(buff.get("level", 1))
+        if current_level >= MAX_BUFF_LEVEL:
+            await query.edit_message_text(f"✅ Достигнут максимальный уровень баффа ({MAX_BUFF_LEVEL}).")
+            return
         required_cards = current_level + 1
         users = load_data(USERS_FILE, {})
         user_data = users.get(str(user_id), {})
@@ -3537,6 +3581,9 @@ async def sell_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if price <= 0:
         await update.message.reply_text("❌ Цена должна быть положительной.")
         return
+    if price > MARKET_MAX_PRICE:
+        await update.message.reply_text(f"❌ Лимит цены одного лота: {_fmt_coins(MARKET_MAX_PRICE)} монет.")
+        return
     if card_id not in get_available_card_ids(user.id):
         await update.message.reply_text("❌ Карточка недоступна для продажи.")
         return
@@ -3590,6 +3637,12 @@ async def my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def unlist_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на канал: {CHANNEL_LINK}")
+        return
     if not context.args:
         await update.message.reply_text("ℹ️ Использование: /unlist <ID объявления>")
         return
@@ -3719,6 +3772,12 @@ async def market_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Неверные данные.")
         return
     buyer_id = query.from_user.id
+    if is_banned(buyer_id):
+        await query.edit_message_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(buyer_id, context):
+        await query.edit_message_text(f"❌ Для покупки необходимо подписаться на канал: {CHANNEL_LINK}")
+        return
     market = load_data(MARKET_FILE, [])
     item = next((m for m in market if m["id"] == listing_id), None)
     if not item:
@@ -4394,7 +4453,7 @@ async def season_prize_3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     users = load_data(USERS_FILE, {})
     for uid, data in users.items():
         data["rating_elo"] = DEFAULT_RATING_ELO
-        data.setdefault("rating_stats", {"wins": 0, "losses": 0, "draws": 0})
+        data["rating_stats"] = {"wins": 0, "losses": 0, "draws": 0}
         users[uid] = data
     save_data(USERS_FILE, users)
     save_data(SEASON_FILE, {
@@ -4478,8 +4537,8 @@ def generate_outcomes():
     return outcomes
 
 async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Эта команда доступна только администратору!")
+    if not has_admin_access(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору и модераторам!")
         return
     args = context.args
     if len(args) < 3:
@@ -4519,10 +4578,11 @@ async def create_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"✅ Матч {team1} - {team2} создан (ID: {new_id}).\n"
                                     f"Приём ставок открыт на {hours} ч. - до {deadline.strftime('%d.%m.%Y %H:%M')}.\n"
                                     "Исходы созданы автоматически.")
+    await post_to_channel(context, f"🏒 <b>Новый матч для ставок!</b>\n\n<b>{html.escape(team1)} — {html.escape(team2)}</b>\n⏳ Приём ставок до: <b>{deadline.strftime('%d.%m.%Y %H:%M')}</b> ({hours:g} ч.)\n🎯 Сделать ставку: /bet")
 
 async def finish_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Эта команда доступна только администратору!")
+    if not has_admin_access(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна администратору и модераторам!")
         return
     args = context.args
     if len(args) < 2:
@@ -4669,6 +4729,12 @@ async def bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if context.user_data.get("bet_state") != "awaiting_amount":
         return
     user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для ставки необходимо подписаться на канал: {CHANNEL_LINK}")
+        return
     try:
         amount = int(update.message.text)
         if amount <= 0:
@@ -5354,7 +5420,7 @@ async def duel_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not context.args:
         await update.message.reply_text(
             "ℹ️ Использование: /duel <ставка>\n"
-            "⚔️ Дуэль карточек: оба игрока ставят монеты, побеждает тот, чьи топ-3 карточки сильнее (+ доля удачи).\n"
+            "⚔️ Дуэль: оба игрока ставят монеты, победитель выбирается честным рандомом 50/50.\n"
             f"💰 Ставка: от {DUEL_MIN_BET} до {DUEL_MAX_BET} монет. Комиссия с банка: {int(DUEL_COMMISSION * 100)}%."
         )
         return
@@ -5389,7 +5455,7 @@ async def duel_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"⚔️ <b>{html.escape(user.first_name or 'Игрок')} бросает вызов на дуэль карточек!</b>\n\n"
         f"💰 Ставка: <b>{_fmt_coins(bet)}</b> монет с каждого\n"
-        f"🃏 Бой решают топ-3 карточки каждого игрока + немного удачи\n"
+        f"🎲 Победитель определяется честным рандомом 50/50\n"
         f"🏆 Победитель забирает банк (комиссия {int(DUEL_COMMISSION * 100)}%)\n\n"
         f"⏳ Вызов действует {DUEL_EXPIRE_SECONDS // 60} минут.",
         parse_mode="HTML",
@@ -5480,10 +5546,8 @@ async def duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
     await asyncio.sleep(2)
 
-    # Шанс победы - логистическая формула от разницы силы топ-3 карточек
-    p_challenger = 1.0 / (1.0 + 10 ** ((power_b - power_a) / 90.0))
-    p_challenger = max(0.15, min(0.85, p_challenger))
-    challenger_wins = random.random() < p_challenger
+    # Дуэль намеренно не зависит от карточек: строго 50/50.
+    challenger_wins = random.random() < 0.5
     winner_id = challenger_id if challenger_wins else acceptor.id
     winner_name = name_a if challenger_wins else name_b
 
@@ -5750,7 +5814,8 @@ async def clan_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🔐 Тип: {clan_type}",
         f"👥 Участников: {len(members)}",
         f"🏦 Казна: {_fmt_coins(clan.get('treasury', 0))} монет",
-        f"⬆️ Прокачка баффа: ур. {upgrade_lvl}",
+        f"⬆️ Прокачка баффа: ур. {upgrade_lvl}/10",
+        (f"💰 До следующего улучшения: {_fmt_coins(CLAN_UPGRADE_COSTS.get(upgrade_lvl + 1))} монет в казне" if CLAN_UPGRADE_COSTS.get(upgrade_lvl + 1) else "🏁 Достигнут максимальный уровень клана (10)"),
         f"📊 Место в рейтинге: {badge}" + (f" (из {len(get_ranked_clans())} в зачёте)" if rank else " (нет в зачёте — казна пуста)"),
     ]
     if bonus:
@@ -5970,7 +6035,7 @@ def main() -> None:
         ])
 
     # Создаём файлы, если их нет
-    for f in [USERS_FILE, BLACKLIST_FILE, MODERATORS_FILE, COINS_FILE, SHOP_FILE, PROMOCODES_FILE, EVENTS_FILE, BETS_FILE, CLANS_FILE, ISSUED_PROMO_CODES_FILE]:
+    for f in [USERS_FILE, BLACKLIST_FILE, MODERATORS_FILE, COINS_FILE, SHOP_FILE, PROMOCODES_FILE, EVENTS_FILE, BETS_FILE, CLANS_FILE, ISSUED_PROMO_CODES_FILE, REFERRALS_FILE]:
         if not os.path.exists(f):
             if f in [BLACKLIST_FILE, MODERATORS_FILE, SHOP_FILE, EVENTS_FILE, BETS_FILE, CLANS_FILE]:
                 save_data(f, [])
@@ -6123,6 +6188,9 @@ def main() -> None:
     application.add_handler(CommandHandler("create_match", create_match))
     application.add_handler(CommandHandler("finish_match", finish_match))
     application.add_handler(CommandHandler("my_bets", my_bets))
+    application.add_handler(CommandHandler("view_matches", view_matches))
+    application.add_handler(CommandHandler("ref", referral_info))
+    application.add_handler(CommandHandler("upgrade_card", upgrade_card))
     application.add_handler(CommandHandler("find_match", find_match))
     application.add_handler(CommandHandler("duel", duel_start))
     application.add_handler(CommandHandler("rating", rating_profile))
@@ -6166,6 +6234,201 @@ def main() -> None:
 
     # Явно запрашиваем все типы апдейтов, чтобы гарантированно получать Poll-апдейты.
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+# ============================ ОБНОВЛЕНИЕ ЭКОНОМИКИ / РЕЙТИНГА 2026 ============================
+
+def _json_contains_user(value, uid: str) -> bool:
+    if isinstance(value, dict):
+        return any(str(k) == uid or _json_contains_user(v, uid) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_json_contains_user(v, uid) for v in value)
+    return str(value) == uid
+
+def _is_pristine_user(user_id: int) -> bool:
+    """Игрок считается новым только если его ID отсутствует во всех игровых хранилищах."""
+    uid = str(user_id)
+    for filename in (USERS_FILE, COINS_FILE, BETS_FILE, MARKET_FILE, TRADES_FILE, CLANS_FILE, BLACKLIST_FILE, REFERRALS_FILE):
+        if _json_contains_user(load_data(filename, {} if filename not in (BETS_FILE, MARKET_FILE, TRADES_FILE, CLANS_FILE, BLACKLIST_FILE) else []), uid):
+            return False
+    return True
+
+def _referral_link(user_id: int) -> str:
+    # Username определяется Telegram автоматически из deep-link в BotFather.
+    username = os.environ.get('BOT_USERNAME', 'YOUR_BOT_USERNAME').lstrip('@')
+    return "https://t.me/" + username + f"?start=ref_{user_id}"
+
+async def finalize_referral_after_first_card(user, context):
+    """Выплата строго один раз после первой сохранённой карточки нового игрока."""
+    refs = load_data(REFERRALS_FILE, {})
+    row = refs.get(str(user.id))
+    if not row or row.get('status') != 'pending' or row.get('rewarded'):
+        return
+    inviter = row.get('inviter_id')
+    # Telegram не предоставляет возраст аккаунта. Поэтому доступны и применяются
+    # надёжные серверные признаки: новый ID во всех JSON, не self-ref, не bot,
+    # подписка (проверена до /get_card), живая карточка и одноразовый журнал.
+    valid = (isinstance(inviter, int) and inviter != user.id and not user.is_bot and
+             bool(user.first_name or user.username) and str(inviter) in load_data(USERS_FILE, {}))
+    row['first_card_at'] = time.time()
+    if valid:
+        update_coins(inviter, REFERRAL_REWARD)
+        row.update({'status':'rewarded','rewarded':True,'rewarded_at':time.time()})
+        try: await context.bot.send_message(inviter, f"🎉 Друг выполнил условия реферала. Вам начислено {REFERRAL_REWARD} монет!")
+        except Exception: pass
+    else:
+        row['status'] = 'rejected'
+    refs[str(user.id)] = row
+    save_data(REFERRALS_FILE, refs)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте."); return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Подпишитесь на канал: {CHANNEL_LINK}, затем повторите /start."); return
+    pristine = _is_pristine_user(user.id)
+    users = load_data(USERS_FILE, {})
+    if pristine:
+        users[str(user.id)] = {"cards": [], "last_drop": 0, "username": user.username, "casino_streak": 0, "coin_streak": 0, "seen_cards": [], "joined_at": time.time()}
+        save_data(USERS_FILE, users)
+        coins=load_data(COINS_FILE,{ }); coins.setdefault(str(user.id),0); save_data(COINS_FILE,coins)
+        payload = context.args[0] if context.args else ''
+        if payload.startswith('ref_'):
+            try: inviter=int(payload[4:])
+            except ValueError: inviter=None
+            if inviter and inviter != user.id and str(inviter) in users:
+                refs=load_data(REFERRALS_FILE,{})
+                if str(user.id) not in refs:
+                    refs[str(user.id)]={"inviter_id":inviter,"joined_at":time.time(),"status":"pending","rewarded":False,"first_card_at":None}
+                    save_data(REFERRALS_FILE,refs)
+    menu=(
+        "🎮 <b>REKHL CARDS — меню</b>\n\n"
+        "<b>🃏 Карточки и экономика</b>\n/get_card · /my_cards · /card_info · /shop · /market · /sell · /trade · /work · /balance · /daily\n"
+        "<b>⚔️ Соревнования</b>\n/rating_team · /find_match · /rating · /duel · /bet · /my_bets\n"
+        "<b>🏰 Кланы</b>\n/create_clan · /join_clan · /clan_info · /clans · /clan_deposit · /clan_upgrade\n"
+        "<b>🎁 Прочее</b>\n/profile · /ref · /leaderboard · /craft · /redeem · /keyboard\n\n"
+        "Рейтинг: сила помогает, но не гарантирует победу. Дуэли — 50/50."
+    )
+    if is_admin(user.id) or is_moderator(user.id):
+        menu += "\n\n<b>🛠 Управление ставками</b>\n/create_match · /finish_match · /view_matches"
+    await update.message.reply_text(menu, parse_mode='HTML', reply_markup=get_main_keyboard() if update.effective_chat.type=='private' else None)
+
+async def referral_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user=update.effective_user; refs=load_data(REFERRALS_FILE,{})
+    try:
+        bot_username = (await context.bot.get_me()).username
+    except Exception:
+        bot_username = os.environ.get('BOT_USERNAME', 'YOUR_BOT_USERNAME')
+    link = 'https://t.me/' + str(bot_username).lstrip('@') + f'?start=ref_{user.id}'
+    mine=[r for r in refs.values() if r.get('inviter_id')==user.id]
+    rewarded=sum(1 for r in mine if r.get('status')=='rewarded')
+    pending=sum(1 for r in mine if r.get('status') in ('pending','waiting_validation'))
+    await update.message.reply_text(
+        f"🤝 <b>Реферальная программа</b>\n\nВаша ссылка:\n<code>{html.escape(link)}</code>\n\n"
+        f"👥 Приглашено: {len(mine)}\n✅ Подтверждено: {rewarded}\n⏳ На проверке: {pending}\n💰 Получено: {rewarded * REFERRAL_REWARD} монет\n\n"
+        "Бонус 50 монет начисляется только один раз после: новый ID отсутствовал во всех игровых JSON, приглашение не от себя, аккаунт не бот, есть профиль, игрок подписан на канал и получил первую карту. Повторные выплаты блокируются журналом рефералов.", parse_mode='HTML')
+
+async def view_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user.id):
+        await update.message.reply_text('❌ Только для администратора и модераторов.'); return
+    events=load_data(EVENTS_FILE,[]); now=time.time()
+    if not events: await update.message.reply_text('📭 Матчей для ставок нет.'); return
+    lines=['🏒 <b>Матчи для ставок</b>\n']
+    for e in sorted(events,key=lambda x:x.get('id',0),reverse=True)[:30]:
+        state='🟢 открыт' if e.get('status')=='active' and e.get('deadline',0)>now else ('⌛ приём закрыт' if e.get('status')=='active' else '🏁 завершён')
+        deadline=datetime.fromtimestamp(e.get('deadline',0)).strftime('%d.%m %H:%M')
+        lines.append(f"#{e['id']} {html.escape(e['team1'])} — {html.escape(e['team2'])}: {state}; до {deadline}; счёт: {e.get('score') or '—'}")
+    await update.message.reply_text('\n'.join(lines),parse_mode='HTML')
+
+RARITY_RATING_CAPS={"Обычная":39,"Редкая":59,"Эпическая":79,"Блещет умом":94,"Легендарная":104,"Эксклюзивная":110}
+def get_player_card_power(user_id:int, card_id:int, card_map:dict)->int:
+    card=card_map.get(card_id,{})
+    base=get_card_power(card); cap=RARITY_RATING_CAPS.get(card.get('rarity'), base)
+    level=load_data(USERS_FILE,{}).get(str(user_id),{}).get('card_upgrades',{}).get(str(card_id),0)
+    return min(cap, base+max(0,int(level))*2)
+
+async def upgrade_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user=update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text('❌ Вы заблокированы в этом боте.'); return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f'❌ Для использования бота необходимо подписаться на канал: {CHANNEL_LINK}'); return
+    if not context.args: await update.message.reply_text('ℹ️ /upgrade_card <card_id> — расходует дубликаты, +2 силы за уровень до потолка редкости.'); return
+    try: cid=int(context.args[0])
+    except ValueError: await update.message.reply_text('❌ Укажите числовой ID.'); return
+    users=load_data(USERS_FILE,{}); data=users.get(str(user.id),{}); cards=data.get('cards',[]); db={c['id']:c for c in load_data(CARDS_FILE,[])}; card=db.get(cid)
+    if not card: await update.message.reply_text('❌ Карточка не найдена.'); return
+    level=int(data.get('card_upgrades',{}).get(str(cid),0)); base=get_card_power(card); cap=RARITY_RATING_CAPS.get(card.get('rarity'),base)
+    if base+level*2>=cap: await update.message.reply_text(f"✅ Эта карта уже достигла лимита силы своей редкости ({cap})."); return
+    cost=level+1
+    if cards.count(cid)<cost+1: await update.message.reply_text(f"❌ Нужны основная карта и {cost} дубликат(а). Всего: {cards.count(cid)}."); return
+    # Remove exactly cost copies, preserving at least one card and saving once.
+    for _ in range(cost): cards.remove(cid)
+    data['cards']=cards; data.setdefault('card_upgrades',{})[str(cid)]=level+1; users[str(user.id)]=data; save_data(USERS_FILE,users)
+    await update.message.reply_text(f"⬆️ {html.escape(card['name'])} улучшена до ур. {level+1}: сила {base+level*2} → {min(cap,base+(level+1)*2)}. Потрачено копий: {cost}. Лимит редкости: {cap}.",parse_mode='HTML')
+
+def _team_strength(team:dict, card_map:dict, owner_id=None)->float:
+    uid=owner_id if owner_id is not None else -1
+    gp=lambda cid: get_player_card_power(uid,cid,card_map) if uid!=-1 else get_card_power(card_map.get(cid,{}))
+    return gp(team['gk'])*1.35 + sum(gp(cid) for cid in team['field'])
+
+def build_match_result_image(name_a,name_b,goals_a,goals_b,periods):
+    if not PIL_AVAILABLE: return None
+    w,h=1100,620; img=Image.new('RGB',(w,h),(10,18,35)); _draw_vertical_gradient(img,(20,55,90),(7,12,25)); d=ImageDraw.Draw(img)
+    title=_load_team_font(42); big=_load_team_font(140); teamfont=_load_team_font(34); small=_load_team_font(24)
+    d.text((55,45),'REKHL • MATCH FINAL',font=title,fill=(225,240,255)); d.line((55,108,w-55,108),fill=(85,170,235),width=3)
+    def center(text,x,y,font,fill):
+        d.text((x-d.textlength(text,font=font)/2,y),text,font=font,fill=fill)
+    center(name_a[:18],250,165,teamfont,(238,245,255)); center(name_b[:18],850,165,teamfont,(238,245,255))
+    center(str(goals_a),250,225,big,(94,180,255)); center(':',550,242,big,(255,210,90)); center(str(goals_b),850,225,big,(94,180,255))
+    center('МАТЧ ОКОНЧЕН',550,410,title,(255,215,100));
+    center('Периоды: ' + '  •  '.join(periods),550,485,small,(180,205,230)); center('Рейтинговый режим',550,535,small,(140,170,200))
+    out=io.BytesIO(); img.save(out,'PNG'); out.seek(0); return out
+
+async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a:int, user_b):
+    team_a=get_rating_team(user_a); team_b=get_rating_team(user_b) if user_b else _generate_bot_team(); card_map={c['id']:c for c in load_data(CARDS_FILE,[])}
+    sa=_team_strength(team_a,card_map,user_a); sb=_team_strength(team_b,card_map,user_b) if user_b else _team_strength(team_b,card_map)
+    # Difference affects chances mildly; weaker side still has at least 36% chance.
+    p_a=max(.36,min(.64,.50+(sa-sb)/900))
+    na=html.escape(await _get_display_name(context,user_a)); nb=html.escape(await _get_display_name(context,user_b))
+    async def send(uid,text):
+        try: await context.bot.send_message(uid,text,parse_mode='HTML')
+        except Exception: pass
+    for uid in [user_a]+([user_b] if user_b else []): await send(uid,f'🏒 <b>Матч начался:</b> {na} 🆚 {nb}')
+    ga=gb=0; period_scores=[]
+    # Low scoring, close games: 0–2 goals per team per period, lead suppresses extra scoring.
+    for period in range(1,4):
+        pa=1 if random.random()<(.30 + (p_a-.5)*.35) else 0
+        pb=1 if random.random()<(.30 - (p_a-.5)*.35) else 0
+        if random.random()<.08: pa+=1
+        if random.random()<.08: pb+=1
+        ga+=pa; gb+=pb; period_scores.append(f'{pa}:{pb}')
+        for uid in [user_a]+([user_b] if user_b else []): await send(uid,f'🏒 Период {period}: <b>{pa}:{pb}</b> • общий счёт <b>{ga}:{gb}</b>')
+        await asyncio.sleep(1.2)
+    if ga==gb:
+        # OT: slightly favour the stronger side but retains large upset chance.
+        if random.random()<p_a: ga+=1
+        else: gb+=1
+        period_scores.append('ОТ')
+    ea=get_rating_elo(user_a); eb=get_rating_elo(user_b) if user_b else DEFAULT_RATING_ELO
+    expected=1/(1+10**((eb-ea)/400)); score=1.0 if ga>gb else 0.0; newa=round(ea+24*(score-expected)); set_rating_elo(user_a,newa)
+    if user_b: newb=round(eb+24*((1-score)-(1-expected))); set_rating_elo(user_b,newb)
+    add_rating_result(user_a,'win' if ga>gb else 'loss');
+    if user_b: add_rating_result(user_b,'win' if gb>ga else 'loss')
+    # Controlled reward: 35% chance only, with a smaller reward for beating much weaker lineup.
+    winner=user_a if ga>gb else user_b; ws,ls=(sa,sb) if ga>gb else (sb,sa)
+    reward=0
+    if winner and random.random()<.35:
+        reward=6 if ws>ls+35 else (12 if ws>=ls-35 else 18); update_coins(winner,reward)
+    image=build_match_result_image(na.lstrip('@'),nb.lstrip('@'),ga,gb,period_scores)
+    for uid,old,new,won in [(user_a,ea,newa,ga>gb)]+([(user_b,eb,newb,gb>ga)] if user_b else []):
+        cap=f"🏁 <b>Матч завершён</b>\n{na} {ga}:{gb} {nb}\n\n{'🏆 Победа!' if won else '😞 Поражение.'}\n⭐ Рейтинг: {old} → {new}"+(f'\n💰 Рейтинговая награда: +{reward}' if uid==winner and reward else '')
+        try:
+            if image: image.seek(0); await context.bot.send_photo(uid,photo=image,caption=cap,parse_mode='HTML')
+            else: await context.bot.send_message(uid,cap,parse_mode='HTML')
+        except Exception: pass
+
 
 if __name__ == "__main__":
     main()
