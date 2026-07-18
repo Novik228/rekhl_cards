@@ -7,7 +7,7 @@ import asyncio
 from datetime import datetime, timedelta
 import logging
 from collections import Counter
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CallbackContext,
@@ -471,6 +471,26 @@ def get_clan_coin_multiplier(user_id: int) -> float:
         return 1.0 + bonus / 100.0
     return 1.0
 
+def get_total_coin_multiplier(user_id: int) -> float:
+    """Итоговый множитель монет: бафф-карта + клановый бафф.
+
+    Бонусы СКЛАДЫВАЮТСЯ (а не перемножаются), а при стаке сразу
+    нескольких баффов суммарный бонус урезается на 15%,
+    чтобы множители не становились слишком большими.
+    Применяется везде, где начисляются монеты:
+    /get_card, /daily, /work, казино, монетка, слоты."""
+    bonuses = []
+    card_bonus = get_coin_bonus_multiplier(user_id) - 1.0
+    if card_bonus > 0:
+        bonuses.append(card_bonus)
+    clan_bonus = get_clan_coin_multiplier(user_id) - 1.0
+    if clan_bonus > 0:
+        bonuses.append(clan_bonus)
+    total_bonus = sum(bonuses)
+    if len(bonuses) > 1:
+        total_bonus *= 0.85  # небольшой минус за стак нескольких баффов
+    return 1.0 + total_bonus
+
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОФИЛЯ ========================
 def add_seen_card(user_id: int, card_id: int):
     users = load_data(USERS_FILE, {})
@@ -635,6 +655,9 @@ USER_COMMANDS_TEXT = (
     "/leaderboard - таблица лидеров\n"
     "/casino <сумма> - сыграть в казино\n"
     "/coin <орел|решка> <сумма> - подбросить монетку\n"
+    "/slots <сумма> - игровые автоматы \U0001F3B0\n"
+    "/keyboard - включить удобную клавиатуру\n"
+    "/hide - скрыть клавиатуру\n"
     "/buff - информация о баффе\n"
     "/set_buff <card_id> - выбрать карту для баффа\n"
     "/upgrade_buff - улучшить бафф\n"
@@ -656,7 +679,7 @@ USER_COMMANDS_TEXT = (
     "/clan_kick <user_id> - исключить участника (создатель)\n"
     "/clan_type <open|closed> - тип клана (создатель)\n"
     "/clan_invite <user_id> - пригласить в закрытый клан\n"
-    "/clan_upgrade - прокачать клан-бафф из казны\n"
+    "/clan_upgrade - прокачать клан-бафф из казны (создатель)\n"
     "/clans - рейтинг кланов\n\n"
     "⏳ Карточку можно получать каждые 6 часов!"
 )
@@ -674,6 +697,9 @@ ADMIN_ONLY_COMMANDS_TEXT = (
     "/remove_moderator <user_id> - удалить модератора\n"
     "/admin_givecoins <user_id> <amount> - выдать монеты\n"
     "/admin_removecoins <user_id> <amount> - забрать монеты\n"
+    "/admin_unlist <ID объявления> - снять любой лот с маркета\n"
+    "/admin_viewcards <user_id> - посмотреть коллекцию игрока\n"
+    "/admin_takecard <user_id> <card_id> [кол-во] - забрать карточку у игрока\n"
     "/admin_addrarity - добавить редкость\n"
     "/admin_editrarity - изменить редкость\n"
     "/admin_listrarities - список редкостей и шансов\n"
@@ -762,8 +788,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML"
         )
     else:
+        # В личке сразу включаем удобную клавиатуру с командами
+        kb = get_main_keyboard() if update.effective_chat.type == "private" else None
         await update.message.reply_text(
-            "🎮 Добро пожаловать в REKHL CARDS!\n\n" + USER_COMMANDS_TEXT
+            "🎮 Добро пожаловать в REKHL CARDS!\n\n" + USER_COMMANDS_TEXT,
+            reply_markup=kb
         )
 
 # Выдача карточки (с баффами и seen_cards)
@@ -854,7 +883,8 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_seen_card(user.id, card["id"])
 
     base_coins = random.randint(10, 50)
-    coin_multiplier = get_coin_bonus_multiplier(user.id) * get_clan_coin_multiplier(user.id)
+    # Все монетные баффы (карта + клан) складываются со штрафом за стак
+    coin_multiplier = get_total_coin_multiplier(user.id)
     coins_earned = int(base_coins * coin_multiplier)
     new_balance = update_coins(user.id, coins_earned)
     card_count = user_data["cards"].count(card["id"])
@@ -872,6 +902,52 @@ async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"💰 Ваш баланс: {new_balance}\n\n"
         f"📚 Теперь в вашей коллекции: {len(user_data['cards'])}"
     )
+    # Анимация зависит от редкости: чем реже карта — тем длиннее и эффектнее
+    RARITY_ANIMATIONS = {
+        "Эксклюзивная": [
+            "🃏 Тянем карточку из колоды...",
+            "🃏 ✨ Колода дрожит...",
+            "😎 💫 Карта СИЯЕТ нереальным светом...",
+            "😎 🌟 Это что-то ЭКСКЛЮЗИВНОЕ...",
+            "😎 🎆 НЕВЕРОЯТНО! Открываем!",
+        ],
+        "Легендарная": [
+            "🃏 Тянем карточку из колоды...",
+            "🃏 ✨ Колода нагревается...",
+            "🔥 Карта пылает огнём...",
+            "🔥 💛 Она СИЯЕТ золотом...",
+            "🔥 🎇 ЛЕГЕНДА! Открываем!",
+        ],
+        "Блещет умом": [
+            "🃏 Тянем карточку из колоды...",
+            "🧠 ⚡ Карта искрит идеями...",
+            "🧠 💡 Она блещет умом...",
+            "🧠 🎓 Гениально! Открываем!",
+        ],
+        "Эпическая": [
+            "🃏 Тянем карточку из колоды...",
+            "💎 Карта отливает синим...",
+            "💎 ✨ Эпично! Открываем!",
+        ],
+        "Редкая": [
+            "🃏 Тянем карточку из колоды...",
+            "✨ Что-то блеснуло! Открываем!",
+        ],
+        "Обычная": [
+            "🃏 Тянем карточку из колоды...",
+            "🃏 Открываем!",
+        ],
+    }
+    frames = RARITY_ANIMATIONS.get(card["rarity"], RARITY_ANIMATIONS["Обычная"])
+    try:
+        anim_msg = await update.message.reply_text(frames[0])
+        for frame in frames[1:]:
+            await asyncio.sleep(0.9)
+            await anim_msg.edit_text(frame)
+        await asyncio.sleep(0.9)
+        await anim_msg.delete()
+    except Exception:
+        pass
     image_path = os.path.join(CARDS_IMAGE_DIR, card["image"])
     if os.path.exists(image_path):
         await update.message.reply_photo(photo=open(image_path, "rb"), caption=caption)
@@ -981,9 +1057,9 @@ async def daily_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Начисляем фиксированные монеты (с учётом клан-баффа за место в топе казны)
-    clan_multiplier = get_clan_coin_multiplier(user.id)
-    daily_amount = int(DAILY_COINS_AMOUNT * clan_multiplier)
+    # Начисляем фиксированные монеты (бафф-карта + клан-бафф складываются)
+    total_multiplier = get_total_coin_multiplier(user.id)
+    daily_amount = int(DAILY_COINS_AMOUNT * total_multiplier)
     new_balance = update_coins(user.id, daily_amount)
 
     # Обновляем дату последнего получения
@@ -996,9 +1072,9 @@ async def daily_claim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"💰 +{daily_amount} монет\n"
         f"💰 Новый баланс: {new_balance} монет\n"
     )
-    if clan_multiplier > 1.0:
-        bonus_percent = round((clan_multiplier - 1.0) * 100)
-        message += f"🌟 Бонус клана (топ рейтинга казны): +{bonus_percent}%\n"
+    if total_multiplier > 1.0:
+        bonus_percent = round((total_multiplier - 1.0) * 100)
+        message += f"🌟 Бонус баффов (карта + клан): +{bonus_percent}%\n"
 
     # Шанс дополнительно получить случайную карточку
     if random.random() < DAILY_CARD_CHANCE:
@@ -1128,15 +1204,26 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             emoji = "❓"
         card_count = user_data["cards"].count(card_id)
         count_text = f" (x{card_count})" if card_count > 1 else ""
-        await update.message.reply_text(
+        pack_text = (
             f"✅ Вы успешно приобрели набор карточек!\n"
             f"🎁 Полученная карточка:\n"
             f"<b>{emoji} {card_rarity}</b>: {card_name}{count_text}\n\n"
             f"💰 Потрачено: {item['price']} монет\n"
             f"💰 Остаток: {new_balance} монет\n\n"
-            f"Просмотреть коллекцию: /my_cards",
-            parse_mode="HTML"
+            f"Просмотреть коллекцию: /my_cards"
         )
+        # Небольшая анимация открытия пака (для легендарных — подлиннее)
+        try:
+            anim_msg = await update.message.reply_text("🎁 Открываем набор...")
+            await asyncio.sleep(0.8)
+            await anim_msg.edit_text("🎁 ✨ Внутри что-то блестит...")
+            if card and is_legendary_or_higher(card["rarity"]):
+                await asyncio.sleep(0.8)
+                await anim_msg.edit_text("🎁 🔥 Оно СИЯЕТ! Неужели...")
+            await asyncio.sleep(0.8)
+            await anim_msg.edit_text(pack_text, parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text(pack_text, parse_mode="HTML")
 
 # Проверка подписки
 async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1157,6 +1244,55 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         await asyncio.sleep(10)
         await context.bot.delete_message(chat_id=message.chat_id, message_id=warn_msg.message_id)
+
+# ============================ КЛАВИАТУРА ============================
+def get_main_keyboard(selective: bool = False) -> ReplyKeyboardMarkup:
+    """Основная reply-клавиатура с популярными командами."""
+    keyboard = [
+        ["/get_card", "/my_cards", "/daily"],
+        ["/shop", "/market", "/balance"],
+        ["/profile", "/leaderboard", "/buff"],
+        ["/my_bets", "/clan_info", "/clans"],
+        ["/hide"],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        selective=selective,
+    )
+
+async def show_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    chat = update.effective_chat
+    text = "⌨️ Клавиатура включена!\nСкрыть её можно командой /hide"
+    if chat.type == "private":
+        await update.message.reply_text(text, reply_markup=get_main_keyboard())
+    else:
+        # В группах используем selective=True + ответ на сообщение пользователя:
+        # клавиатуру увидит только тот, кто вызвал команду, а не весь чат.
+        await update.message.reply_text(
+            text,
+            reply_markup=get_main_keyboard(selective=True),
+            reply_to_message_id=update.message.message_id,
+        )
+
+async def hide_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    text = "⌨️ Клавиатура скрыта. Вернуть: /keyboard"
+    if chat.type == "private":
+        await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=ReplyKeyboardRemove(selective=True),
+            reply_to_message_id=update.message.message_id,
+        )
 
 # ============================ АДМИН-КОМАНДЫ ============================
 async def admin_addcard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2204,9 +2340,9 @@ async def casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     payout = int(bet * multiplier)
     if multiplier > 1.0:
-        # Небольшой бафф топ-1 клана применяется только к реальному выигрышу
-        clan_multiplier = get_clan_coin_multiplier(user.id)
-        payout = int(bet + (payout - bet) * clan_multiplier)
+        # Баффы (карта + клан) применяются только к реальному выигрышу
+        total_multiplier = get_total_coin_multiplier(user.id)
+        payout = int(bet + (payout - bet) * total_multiplier)
     net = payout - bet  # реальное изменение баланса
     update_coins(user.id, -bet)
     update_coins(user.id, payout)
@@ -2285,8 +2421,9 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if random.random() < win_chance:
         result = choice
         set_coin_streak(user.id, streak + 1)
-        clan_multiplier = get_clan_coin_multiplier(user.id)
-        win_amount = int(bet * 2 * clan_multiplier)
+        # Баффы (карта + клан) применяются только к чистому выигрышу (как в казино и слотах)
+        total_multiplier = get_total_coin_multiplier(user.id)
+        win_amount = int(bet + bet * total_multiplier)
         update_coins(user.id, -bet)
         update_coins(user.id, win_amount)
         new_balance = get_coins(user.id)
@@ -2313,6 +2450,96 @@ async def coin_flip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🔥 Серия побед сброшена.",
             parse_mode="HTML"
         )
+
+# ============================ СЛОТЫ (/slots) ============================
+# Символы и их веса (чем реже символ — тем выше выплата).
+# RTP автомата ~68% — это намеренный слив монет из экономики.
+SLOT_SYMBOLS = ["🍏", "🍌", "🍒", "🍋", "🍇", "⚫️"]
+SLOT_WEIGHTS = [6, 5, 4, 3, 2, 1]
+SLOT_PAYOUTS = {"🍏": 3, "🍌": 4, "🍒": 5, "🍋": 8, "🍇": 15, "⚫️": 75}
+
+async def slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
+        return
+    if not await is_subscribed(user.id, context):
+        await update.message.reply_text(f"❌ Для использования бота необходимо подписаться на наш канал: {CHANNEL_LINK}")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "ℹ️ Использование: /slots <сумма>\n\n"
+            "🎰 Выплаты за три одинаковых:\n"
+            "⚫️⚫️⚫️ — x75\n"
+            "🍇🍇🍇 — x15\n"
+            "🍋🍋🍋 — x8\n"
+            "🍒🍒🍒 — x5\n"
+            "🍌🍌🍌 — x4\n"
+            "🍏🍏🍏 — x3\n"
+            "Два одинаковых — возврат ставки"
+        )
+        return
+    try:
+        bet = int(context.args[0])
+        if bet <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Введите положительное число.")
+        return
+    if get_coins(user.id) < bet:
+        await update.message.reply_text("❌ Недостаточно монет!")
+        return
+    update_coins(user.id, -bet)
+    reels = random.choices(SLOT_SYMBOLS, weights=SLOT_WEIGHTS, k=3)
+    reels_text = " | ".join(reels)
+    if reels[0] == reels[1] == reels[2]:
+        mult = SLOT_PAYOUTS[reels[0]]
+        win_amount = bet * mult
+        # Баффы (карта + клан) применяются только к чистому выигрышу (как в казино).
+        total_multiplier = get_total_coin_multiplier(user.id)
+        win_amount = int(bet + (win_amount - bet) * total_multiplier)
+        update_coins(user.id, win_amount)
+        result_line = f"🎉 ДЖЕКПОТ x{mult}! +{win_amount - bet} монет"
+    elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
+        update_coins(user.id, bet)
+        result_line = "😐 Два одинаковых — ставка вернулась (0)"
+    else:
+        result_line = f"💀 Пусто. -{bet} монет"
+    new_balance = get_coins(user.id)
+    final_text = (
+        f"🎰 <b>Слоты</b>\n\n"
+        f"[ {reels_text} ]\n\n"
+        f"{result_line}\n"
+        f"💰 Баланс: {new_balance} монет"
+    )
+    # Небольшая анимация: барабаны открываются по одному
+    spin_msg = None
+    try:
+        spin_msg = await update.message.reply_text(
+            "🎰 <b>Слоты</b>\n\n[ ❓ | ❓ | ❓ ]\n\nКрутим барабаны...",
+            parse_mode="HTML"
+        )
+        await asyncio.sleep(0.8)
+        await spin_msg.edit_text(
+            f"🎰 <b>Слоты</b>\n\n[ {reels[0]} | ❓ | ❓ ]\n\nКрутим барабаны...",
+            parse_mode="HTML"
+        )
+        await asyncio.sleep(0.8)
+        await spin_msg.edit_text(
+            f"🎰 <b>Слоты</b>\n\n[ {reels[0]} | {reels[1]} | ❓ ]\n\nКрутим барабаны...",
+            parse_mode="HTML"
+        )
+        await asyncio.sleep(0.8)
+        await spin_msg.edit_text(final_text, parse_mode="HTML")
+    except Exception:
+        # Анимация не критична: если что-то пошло не так — просто показываем результат
+        try:
+            if spin_msg:
+                await spin_msg.edit_text(final_text, parse_mode="HTML")
+            else:
+                await update.message.reply_text(final_text, parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text(final_text, parse_mode="HTML")
 
 # ============================ БАФФЫ ============================
 async def buff_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2347,7 +2574,9 @@ async def buff_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Уровень: {level}\n\n"
         f"<b>Эффекты:</b>\n"
         f"⏳ Уменьшение кулдауна: -{cooldown_reduction}% (текущий кулдаун: {current_cooldown_hours:.1f} ч)\n"
-        f"💰 Бонус к монетам: +{coin_bonus}%\n\n"
+        f"💰 Бонус к монетам: +{coin_bonus}%\n"
+        f"📌 Действует на: /get_card, /daily, /work, казино, монетку и слоты\n"
+        f"🤝 Складывается с клан-баффом (при стаке общий бонус слегка урезается)\n\n"
         f"Чтобы улучшить бафф, используйте /upgrade_buff (потребуются копии карты)"
     )
     await update.message.reply_text(message, parse_mode="HTML")
@@ -3109,6 +3338,108 @@ async def unlist_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     add_one_card(user.id, item["card_id"])
     await update.message.reply_text(f"✅ Объявление #{listing_id} снято, карточка возвращена в коллекцию.")
 
+async def admin_unlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Админ снимает любой лот с маркета; карточка возвращается продавцу."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
+        return
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /admin_unlist <ID объявления>")
+        return
+    try:
+        listing_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID.")
+        return
+    market = load_data(MARKET_FILE, [])
+    item = next((m for m in market if m["id"] == listing_id), None)
+    if not item:
+        await update.message.reply_text("❌ Объявление не найдено.")
+        return
+    market = [m for m in market if m["id"] != listing_id]
+    save_data(MARKET_FILE, market)
+    add_one_card(item["seller_id"], item["card_id"])
+    cards = load_data(CARDS_FILE, [])
+    card = next((c for c in cards if c["id"] == item["card_id"]), {})
+    card_name = html.escape(card.get("name", str(item["card_id"])))
+    await update.message.reply_text(
+        f"✅ Объявление #{listing_id} («{card_name}») снято. Карточка возвращена игроку {item['seller_id']}.",
+        parse_mode="HTML",
+    )
+    try:
+        await context.bot.send_message(
+            item["seller_id"],
+            f"ℹ️ Ваше объявление #{listing_id} снято администратором. Карточка возвращена в коллекцию.",
+        )
+    except Exception:
+        pass
+
+async def admin_viewcards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Админ смотрит коллекцию любого игрока."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
+        return
+    if not context.args:
+        await update.message.reply_text("ℹ️ Использование: /admin_viewcards <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID.")
+        return
+    users = load_data(USERS_FILE, {})
+    if str(target_id) not in users:
+        await update.message.reply_text("❌ Игрок не найден.")
+        return
+    header = (
+        f"👤 <b>Игрок {target_id}</b>\n"
+        f"💰 Монет: {get_coins(target_id)}\n\n"
+    )
+    collection = await show_collection_with_ids(target_id)
+    await update.message.reply_text(header + collection, parse_mode="HTML")
+
+async def admin_takecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Админ изымает карточку (или несколько копий) у игрока."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Эта команда доступна только администратору!")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("ℹ️ Использование: /admin_takecard <user_id> <card_id> [количество]")
+        return
+    try:
+        target_id = int(context.args[0])
+        card_id = int(context.args[1])
+        take_count = int(context.args[2]) if len(context.args) > 2 else 1
+        if take_count <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Все аргументы — положительные числа.")
+        return
+    removed = 0
+    for _ in range(take_count):
+        if not remove_one_card(target_id, card_id):
+            break
+        removed += 1
+    cards = load_data(CARDS_FILE, [])
+    card = next((c for c in cards if c["id"] == card_id), {})
+    card_name = html.escape(card.get("name", str(card_id)))
+    if removed == 0:
+        await update.message.reply_text(
+            "❌ У игрока нет этой карточки в коллекции (копии на маркете/в работе не изымаются)."
+        )
+        return
+    await update.message.reply_text(
+        f"✅ Изъято «{card_name}» x{removed} у игрока {target_id}.",
+        parse_mode="HTML",
+    )
+    try:
+        await context.bot.send_message(
+            target_id,
+            f"⚠️ Администратор изъял у вас карточку «{card_name}» (x{removed}).",
+        )
+    except Exception:
+        pass
+
 async def market_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -3196,8 +3527,10 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"⏳ Карточка ещё работает. Осталось: {left // 60} мин.")
         return
     last_work = user_data.get("last_work", 0)
-    if time.time() - last_work < WORK_COOLDOWN_SECONDS:
-        left = int(WORK_COOLDOWN_SECONDS - (time.time() - last_work))
+    # Бафф-карта сокращает и кулдаун работы (как кулдаун /get_card)
+    work_cooldown = WORK_COOLDOWN_SECONDS * get_cooldown_multiplier(user.id)
+    if time.time() - last_work < work_cooldown:
+        left = int(work_cooldown - (time.time() - last_work))
         await update.message.reply_text(f"⏳ Следующая работа через {left // 60} мин.")
         return
     if not context.args:
@@ -3218,9 +3551,15 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     reward_range = WORK_REWARDS.get(card["rarity"], (15, 30))
     reward = random.randint(*reward_range)
+    # Монетные баффы (карта + клан) действуют и на заработок с работы
+    reward = int(reward * get_total_coin_multiplier(user.id))
     if not remove_one_card(user.id, card_id):
         await update.message.reply_text("❌ Не удалось отправить карточку на работу.")
         return
+    # ВАЖНО: remove_one_card уже сохранил USERS_FILE без карточки.
+    # Перезагружаем данные: запись старой копии users ниже вернула бы
+    # карточку в коллекцию, а после работы она добавилась бы ещё раз (дюп).
+    users = load_data(USERS_FILE, {})
     user_data = users.get(str(user.id), {})
     user_data["working_card"] = {
         "card_id": card_id,
@@ -4911,6 +5250,9 @@ async def clan_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if user.id not in clan.get("members", []):
         await update.message.reply_text("❌ Вы не участник этого клана.")
         return
+    if clan.get("owner") != user.id:
+        await update.message.reply_text("❌ Прокачивать клан из казны может только создатель клана.")
+        return
     level = clan.get("buff_upgrade_level", 0)
     next_level = level + 1
     cost = CLAN_UPGRADE_COSTS.get(next_level)
@@ -5110,10 +5452,16 @@ def main() -> None:
     application.add_handler(CommandHandler("remove_moderator", remove_moderator))
     application.add_handler(CommandHandler("admin_givecoins", admin_givecoins))
     application.add_handler(CommandHandler("admin_removecoins", admin_removecoins))
+    application.add_handler(CommandHandler("admin_unlist", admin_unlist))
+    application.add_handler(CommandHandler("admin_viewcards", admin_viewcards))
+    application.add_handler(CommandHandler("admin_takecard", admin_takecard))
     application.add_handler(CommandHandler("admin_listrarities", admin_listrarities))
     application.add_handler(CommandHandler("admin_listshop", admin_listshop))
     application.add_handler(CommandHandler("casino", casino))
     application.add_handler(CommandHandler("coin", coin_flip))
+    application.add_handler(CommandHandler("slots", slots))
+    application.add_handler(CommandHandler("keyboard", show_keyboard))
+    application.add_handler(CommandHandler("hide", hide_keyboard))
     application.add_handler(CommandHandler("buff", buff_info))
     application.add_handler(CommandHandler("set_buff", set_buff))
     application.add_handler(CommandHandler("upgrade_buff", upgrade_buff))
