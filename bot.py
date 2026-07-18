@@ -392,7 +392,7 @@ def get_card_power(card: dict) -> int:
     rarity = card.get("rarity")
     if rarity in RARITY_POWER:
         return RARITY_POWER[rarity]
-    # Кастомные редкости: сила вычисляется по шансу выпадения: чем реже - тем сильнее.
+    # Кастомные редкости: с����ла вычисляется по шансу выпадения: чем реже - тем сильнее.
     try:
         chance = get_rarity_drop_chance(rarity)
     except Exception:
@@ -859,12 +859,14 @@ USER_COMMANDS_TEXT = (
     "/upgrade_buff - улучшить бафф\n"
     "/redeem <код> - активировать промокод\n"
     "/profile - ваш профиль\n"
+    "/ref - реферальная ссылка (приглашай друзей — получай монеты)\n"
     "/bet - сделать ставку (инлайн-меню)\n"
     "/my_bets - мои ставки\n"
     "/daily - ежедневная награда (серия дней даёт до +100%)\n"
     "/rating_team - собрать состав для рейтингового режима\n"
     "/find_match - найти соперника (рейтинговый режим)\n"
     "/duel <ставка> - дуэль карточек 1 на 1 на монеты\n"
+    "/upgrade_card <card_id> - улучшить карту дубликатами (+2 силы)\n"
     "/rating - мой рейтинг и текущий состав\n\n"
     "🏰 Кланы:\n"
     "/create_clan <название> - создать клан (1000 монет)\n"
@@ -908,7 +910,8 @@ ADMIN_ONLY_COMMANDS_TEXT = (
     "/start_season - начать новый рейтинговый сезон\n"
     "/end_season - завершить сезон и выдать призы\n"
     "/create_match <команда1> <команда2> <часы> - создать матч (приём ставок N часов)\n"
-    "/finish_match <match_id> <счёт> - завершить матч (например 3:1)"
+    "/finish_match <match_id> <счёт> - завершить матч (например 3:1)\n"
+    "/view_matches - список матчей для ставок"
 )
 
 MODERATOR_ONLY_COMMANDS_TEXT = (
@@ -917,80 +920,9 @@ MODERATOR_ONLY_COMMANDS_TEXT = (
     "/admin_deletecard <card_id> - удалить карточку\n"
     "/admin_addshopitem - добавить товар в магазин\n"
     "/admin_listshop - список товаров\n"
-    "/admin_editcard <card_id> - изменить карточку"
+    "/admin_editcard <card_id> - изменить карточку\n"
+    "/view_matches - список матчей для ставок"
 )
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if is_banned(user.id):
-        await update.message.reply_text("❌ Вы заблокированы в этом боте.")
-        return
-    if not await is_subscribed(user.id, context):
-        await update.message.reply_text(
-            "❌ Для использования бота необходимо подписаться на наш канал!\n"
-            f"Подпишитесь здесь: {CHANNEL_LINK}\n"
-            "После подписки отправьте /start снова."
-        )
-        return
-
-    users = load_data(USERS_FILE, {})
-    is_new_user = str(user.id) not in users
-    if is_new_user:
-        users[str(user.id)] = {
-            "cards": [],
-            "last_drop": 0,
-            "username": user.username,
-            "casino_streak": 0,
-            "coin_streak": 0,
-            "seen_cards": []
-        }
-        save_data(USERS_FILE, users)
-        coins_data = load_data(COINS_FILE, {})
-        if str(user.id) not in coins_data:
-            coins_data[str(user.id)] = 0
-            save_data(COINS_FILE, coins_data)
-        if not is_admin(user.id) and not is_moderator(user.id):
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"Новый пользователь: @{user.username} | ID: {user.id}"
-            )
-    else:
-        user_data = users.get(str(user.id), {})
-        if "casino_streak" not in user_data:
-            user_data["casino_streak"] = 0
-        if "coin_streak" not in user_data:
-            user_data["coin_streak"] = 0
-        if "seen_cards" not in user_data:
-            user_data["seen_cards"] = []
-        users[str(user.id)] = user_data
-        save_data(USERS_FILE, users)
-
-    # Все пользователи (включая админов/модераторов) видят обычные команды.
-    # Админы и модераторы дополнительно видят свой набор команд.
-    # ВАЖНО: тексты команд содержат плейсхолдеры вида "card_id", "user_id" в угловых скобках.
-    # При parse_mode="HTML" Telegram пытается разобрать их как теги и падает,
-    # поэтому текст экранируем через html.escape(), а настоящие теги <b> добавляем уже поверх.
-    if is_admin(user.id):
-        await update.message.reply_text(
-            "👑 Вы администратор.\n\n"
-            "🛠 <b>Админские команды:</b>\n" + html.escape(ADMIN_ONLY_COMMANDS_TEXT) + "\n\n"
-            "👤 <b>Обычные команды:</b>\n" + html.escape(USER_COMMANDS_TEXT),
-            parse_mode="HTML"
-        )
-    elif is_moderator(user.id):
-        await update.message.reply_text(
-            "🛡 Вы модератор.\n\n"
-            "🛠 <b>Модераторские команды:</b>\n" + html.escape(MODERATOR_ONLY_COMMANDS_TEXT) + "\n\n"
-            "👤 <b>Обычные команды:</b>\n" + html.escape(USER_COMMANDS_TEXT),
-            parse_mode="HTML"
-        )
-    else:
-        # В личке сразу включаем удобную клавиатуру с командами
-        kb = get_main_keyboard() if update.effective_chat.type == "private" else None
-        await update.message.reply_text(
-            "🎮 Добро пожаловать в REKHL CARDS!\n\n" + USER_COMMANDS_TEXT,
-            reply_markup=kb
-        )
 
 # Выдача карточки (с баффами и seen_cards)
 async def get_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1491,14 +1423,14 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         warn_msg = await message.reply_text(
             "❌ Для использования бота необходимо подписаться на наш канал!\n"
             f"Подпишитесь здесь: {CHANNEL_LINK}\n"
-            "После подписки отправьте /start"
+            "После по��писки отправьте /start"
         )
         await asyncio.sleep(10)
         await context.bot.delete_message(chat_id=message.chat_id, message_id=warn_msg.message_id)
 
 # ============================ КЛАВИАТУРА ============================
 KEYBOARD_LAYOUT = [
-    ["🎴 Получить карту", "📚 Коллекция", "🎁 Награда"],
+    ["🎴 Получить карту", "📚 Коллекция", "🎁 На��рада"],
     ["🛒 Магазин", "🏪 Маркет", "💰 Баланс"],
     ["👤 Профиль", "🏆 Топ", "🃏 Бафф"],
     ["📊 Мои ставки", "🏰 Клан", "⚔️ Рейтинг"],
@@ -1805,7 +1737,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(chat_id=uid, text=f"📢 Рассылка от администратора:\n\n{message}")
             count += 1
         except Exception as e:
-            logger.error(f"Ошибка рассылки для {user_id}: {e}")
+            logger.error(f"Ошибка рассыл��и для {user_id}: {e}")
             errors += 1
     await update.message.reply_text(f"✅ Рассылка завершена!\nОтправлено: {count} пользователям\nОшибок: {errors}")
 
@@ -1983,7 +1915,7 @@ async def admin_addrarity(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def admin_rarity_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if is_default_rarity(name):
-        await update.message.reply_text("❌ Это стандартная редкость из кода — добавить её нельзя. Выберите другое название.")
+        await update.message.reply_text("❌ Это стандартная редкость из кода — добавить е�� нельзя. Выберите другое название.")
         return ADMIN_RARITY_NAME
     context.user_data["new_rarity"] = {"name": name}
     await update.message.reply_text("Введите смайлик для этой редкости:")
@@ -3296,7 +3228,7 @@ async def trade_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         [InlineKeyboardButton("❌ Отклонить", callback_data=f"trade_decline_{trade_id}")],
     ]
     await update.message.reply_text(
-        f"🔄 Предложение обмена отправлено игроку {target_id}!\n"
+        f"🔄 Предложение обм��на отправлено игроку {target_id}!\n"
         f"Вы предлагаете: {card['name']} ({get_rarity_emoji(card['rarity'])} {card['rarity']})"
     )
     try:
@@ -3582,7 +3514,7 @@ async def sell_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Цена должна быть положительной.")
         return
     if price > MARKET_MAX_PRICE:
-        await update.message.reply_text(f"❌ Лимит цены одного лота: {_fmt_coins(MARKET_MAX_PRICE)} монет.")
+        await update.message.reply_text(f"❌ Лимит цены од��ого лота: {_fmt_coins(MARKET_MAX_PRICE)} монет.")
         return
     if card_id not in get_available_card_ids(user.id):
         await update.message.reply_text("❌ Карточка недоступна для продажи.")
@@ -4041,7 +3973,7 @@ async def events_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"⏳ Длительность: {mins} минут\n\n"
                 f"🔥 Успей получить карточку: /get_card в боте!",
             )
-            await update.message.reply_text(f"✅ Буст {rarity} x{mult} активирован на {mins} мин!")
+            await update.message.reply_text(f"✅ Б��ст {rarity} x{mult} активирован на {mins} мин!")
             context.user_data.pop("evt_flow", None)
             context.user_data.pop("evt_step", None)
             return
@@ -4099,7 +4031,7 @@ async def events_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             })
             save_data(CHANNEL_EVENTS_FILE, events)
             await update.message.reply_text(
-                f"✅ Буст запланирован! Начало через {delay} мин, длительность {mins} мин.\n"
+                f"✅ Буст запланирован! Начало через {delay} мин, длитель��ость {mins} мин.\n"
                 f"ID события: {eid}"
             )
             context.user_data.pop("evt_flow", None)
@@ -4273,7 +4205,7 @@ async def _finalize_poll_event(event: dict, results, context: ContextTypes.DEFAU
 async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает обновления о состоянии голосования.
 
-    Кэширует текущие голоса в событие при каждом апдейте: Telegram НЕ присылает
+    Кэширует тек��щие голоса в событие при каждом апдейте: Telegram НЕ присылает
     финальный Poll-апдейт, когда опрос закрывается автоматически по open_period,
     поэтому кэш — единственный источник итогов для фонового воркера.
     """
@@ -4606,7 +4538,7 @@ async def finish_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     events = load_data(EVENTS_FILE, [])
     event = next((e for e in events if e["id"] == match_id), None)
     if not event:
-        await update.message.reply_text("❌ Матч не найден.")
+        await update.message.reply_text("❌ Ма��ч не найден.")
         return
     if event["status"] != "active":
         await update.message.reply_text("❌ Матч уже завершён.")
@@ -5177,9 +5109,9 @@ NEUTRAL_EVENTS = [
     "🔄 {team} производит замену вратаря на паузе в игре.",
     "📢 Диктор объявляет статистику бросков по воротам.",
     "🥶 Короткая пауза на смазку коньков — игра вот-вот продолжится.",
-    "🎶 Диджей арены заводит трибуны музыкой во время паузы.",
+    "🎶 Диджей аре��ы заводит трибуны музыкой во время паузы.",
     "🧤 {player} ({team}) меняет сломанную клюшку у скамейки запасных.",
-    "📸 Оператор ловит крупный план {player} ({team}) для повтора на экране.",
+    "���� Оператор ловит крупный план {player} ({team}) для повтора на экране.",
     "🍿 Болельщики {team} скандируют кричалку в поддержку своей команды.",
     "🧊 Мелкая заминка — рабочие устраняют выбоину на льду.",
     "🎙 Комментатор отмечает высокий темп сегодняшнего матча.",
@@ -5517,7 +5449,7 @@ async def duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         duels.pop(duel_id, None)
         await query.answer("У автора вызова уже не хватает монет - дуэль отменена.", show_alert=True)
         try:
-            await query.edit_message_text("❌ Дуэль отменена: у автора вызова не хватает монет.")
+            await query.edit_message_text("��� Дуэль отменена: у автора вызова не хватает монет.")
         except Exception:
             pass
         return
@@ -5828,7 +5760,7 @@ async def clan_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     clan_id = get_user_clan_id(user.id)
     if not clan_id:
-        await update.message.reply_text("❌ Вы не в клане.")
+        await update.message.reply_text("❌ В�� не в клане.")
         return
     clan = get_clan_by_id(clan_id)
     if not clan or clan["owner"] != user.id:
@@ -5979,7 +5911,7 @@ async def clan_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if clan.get("treasury", 0) < cost:
         await update.message.reply_text(
-            f"❌ Нужно {_fmt_coins(cost)} монет в казне. Сейчас: {_fmt_coins(clan.get('treasury', 0))}."
+            f"❌ ��ужно {_fmt_coins(cost)} монет в казне. Сейчас: {_fmt_coins(clan.get('treasury', 0))}."
         )
         return
     clan["treasury"] -= cost
@@ -6293,6 +6225,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         users[str(user.id)] = {"cards": [], "last_drop": 0, "username": user.username, "casino_streak": 0, "coin_streak": 0, "seen_cards": [], "joined_at": time.time()}
         save_data(USERS_FILE, users)
         coins=load_data(COINS_FILE,{ }); coins.setdefault(str(user.id),0); save_data(COINS_FILE,coins)
+        if not is_admin(user.id) and not is_moderator(user.id):
+            try:
+                await context.bot.send_message(ADMIN_ID, f"Новый пользователь: @{user.username} | ID: {user.id}")
+            except Exception as e:
+                logger.error(f"Не удалось уведомить администратора о новом пользователе: {e}")
         payload = context.args[0] if context.args else ''
         if payload.startswith('ref_'):
             try: inviter=int(payload[4:])
@@ -6302,17 +6239,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 if str(user.id) not in refs:
                     refs[str(user.id)]={"inviter_id":inviter,"joined_at":time.time(),"status":"pending","rewarded":False,"first_card_at":None}
                     save_data(REFERRALS_FILE,refs)
-    menu=(
-        "🎮 <b>REKHL CARDS — меню</b>\n\n"
-        "<b>🃏 Карточки и экономика</b>\n/get_card · /my_cards · /card_info · /shop · /market · /sell · /trade · /work · /balance · /daily\n"
-        "<b>⚔️ Соревнования</b>\n/rating_team · /find_match · /rating · /duel · /bet · /my_bets\n"
-        "<b>🏰 Кланы</b>\n/create_clan · /join_clan · /clan_info · /clans · /clan_deposit · /clan_upgrade\n"
-        "<b>🎁 Прочее</b>\n/profile · /ref · /leaderboard · /craft · /redeem · /keyboard\n\n"
-        "Рейтинг: сила помогает, но не гарантирует победу. Дуэли — 50/50."
-    )
-    if is_admin(user.id) or is_moderator(user.id):
-        menu += "\n\n<b>🛠 Управление ставками</b>\n/create_match · /finish_match · /view_matches"
-    await update.message.reply_text(menu, parse_mode='HTML', reply_markup=get_main_keyboard() if update.effective_chat.type=='private' else None)
+    else:
+        # Бэкфилл полей для старых аккаунтов (как в старой версии /start)
+        user_data = users.get(str(user.id))
+        if user_data is not None:
+            user_data.setdefault("casino_streak", 0)
+            user_data.setdefault("coin_streak", 0)
+            user_data.setdefault("seen_cards", [])
+            user_data.setdefault("username", user.username)
+            users[str(user.id)] = user_data
+            save_data(USERS_FILE, users)
+
+    # Меню в классическом стиле: у обычных игроков — свои команды,
+    # у администратора и модераторов — дополнительно свой набор.
+    # ВАЖНО: тексты команд содержат плейсхолдеры вида "card_id" в угловых скобках.
+    # При parse_mode="HTML" Telegram пытается разобрать их как теги и падает,
+    # поэтому текст экранируем через html.escape(), а настоящие теги <b> добавляем уже поверх.
+    if is_admin(user.id):
+        await update.message.reply_text(
+            "👑 Вы администратор.\n\n"
+            "🛠 <b>Админские команды:</b>\n" + html.escape(ADMIN_ONLY_COMMANDS_TEXT) + "\n\n"
+            "👤 <b>Обычные команды:</b>\n" + html.escape(USER_COMMANDS_TEXT),
+            parse_mode="HTML"
+        )
+    elif is_moderator(user.id):
+        await update.message.reply_text(
+            "🛡 Вы модератор.\n\n"
+            "🛠 <b>Модераторские команды:</b>\n" + html.escape(MODERATOR_ONLY_COMMANDS_TEXT) + "\n\n"
+            "👤 <b>Обычные команды:</b>\n" + html.escape(USER_COMMANDS_TEXT),
+            parse_mode="HTML"
+        )
+    else:
+        # Обычный игрок видит ТОЛЬКО игровые команды (никакого управления ставками).
+        # В личке сразу включаем удобную клавиатуру с командами.
+        kb = get_main_keyboard() if update.effective_chat.type == "private" else None
+        await update.message.reply_text(
+            "🎮 Добро пожаловать в REKHL CARDS!\n\n" + USER_COMMANDS_TEXT,
+            reply_markup=kb
+        )
 
 async def referral_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user=update.effective_user; refs=load_data(REFERRALS_FILE,{})
@@ -6341,7 +6305,7 @@ async def view_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append(f"#{e['id']} {html.escape(e['team1'])} — {html.escape(e['team2'])}: {state}; до {deadline}; счёт: {e.get('score') or '—'}")
     await update.message.reply_text('\n'.join(lines),parse_mode='HTML')
 
-RARITY_RATING_CAPS={"Обычная":39,"Редкая":59,"Эпическая":79,"Блещет умом":94,"Легендарная":104,"Эксклюзивная":110}
+RARITY_RATING_CAPS={"Обыч��ая":39,"Редкая":59,"Эпическая":79,"Блещет умом":94,"Легендарная":104,"Эксклюзивная":110}
 def get_player_card_power(user_id:int, card_id:int, card_map:dict)->int:
     card=card_map.get(card_id,{})
     base=get_card_power(card); cap=RARITY_RATING_CAPS.get(card.get('rarity'), base)
