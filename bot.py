@@ -685,10 +685,10 @@ def get_rating_title(elo: int):
 # Категории REKHL: Prospect → Average → Elite → Franchise.
 # Соперник в /find_match подбирается ТОЛЬКО внутри одного ранга.
 RATING_RANKS = [
-    (1300, "🌟", "Franchise"),
-    (1150, "💎", "Elite"),
-    (1000, "🥈", "Average"),
-    (0, "🥉", "Prospect"),
+    (1300, "🌟", "Франшиза"),
+    (1150, "💎", "Элита"),
+    (1000, "🥈", "Средний"),
+    (0, "🥉", "Проспект"),
 ]
 
 def get_rating_rank(elo: int):
@@ -696,7 +696,7 @@ def get_rating_rank(elo: int):
     for i, (threshold, emoji, name) in enumerate(RATING_RANKS):
         if elo >= threshold:
             return len(RATING_RANKS) - i, emoji, name
-    return 1, "🥉", "Prospect"
+    return 1, "🥉", "Проспект"
 
 def get_rating_stats(user_id: int) -> dict:
     users = load_data(USERS_FILE, {})
@@ -975,7 +975,7 @@ USER_COMMANDS_TEXT = (
     "/casino <сумма> - сыграть в казино\n"
     "/coin <орел|решка> <сумма> - подбросить монетку (макс. 300, рискованно!)\n"
     "/slots <сумма> - игровые автоматы \U0001F3B0\n"
-    "/duel <ставка> - дуэль карточек 1 на 1 на монеты\n"
+    "/duel <ставка> - дуэль 1 на 1 на монеты\n"
     "/bet - сделать ставку на матч (инлайн-меню)\n"
     "/my_bets - мои ставки\n\n"
     "⚔️ Рейтинговый режим:\n"
@@ -7188,11 +7188,15 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
     card_map = {c['id']: c for c in load_data(CARDS_FILE, [])}
     sa = _team_strength(team_a, card_map, user_a)
     sb = _team_strength(team_b, card_map, user_b)
-    # РЕБАЛАНС: разница сил влияет мягче (слабый состав реально может
-    # победить: минимум 40% шанса), а случайная «форма дня» делает каждый
-    # матч уникальным — одна и та же пара команд играет по-разному.
-    form = random.uniform(-0.07, 0.07)
-    p_a = max(.40, min(.60, .50 + (sa - sb) / 1400 + form))
+    ea = get_rating_elo(user_a)
+    eb = get_rating_elo(user_b) if user_b else DEFAULT_RATING_ELO
+    # РЕБАЛАНС: сила состава и ELO теперь чуть заметнее влияют на исход,
+    # но апсет всё ещё возможен. Рандом ослаблен, чтобы сильная команда
+    # чаще подтверждала статус, а не выигрывала только из-за «формы дня».
+    strength_edge = (sa - sb) / 1050
+    elo_edge = (ea - eb) / 2800
+    form = random.uniform(-0.045, 0.045)
+    p_a = max(.37, min(.63, .50 + strength_edge + elo_edge + form))
     # Тактики тренеров: (бонус к своему шансу забить, бонус к шансу соперника забить)
     atk_a, give_a = _team_tactic_mods(team_a, card_map)
     atk_b, give_b = _team_tactic_mods(team_b, card_map)
@@ -7222,13 +7226,53 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
         tactic = (team or {}).get('tactic', 'balanced')
         if plain:
             return f"{cname} ({TACTIC_PLAIN.get(tactic, 'Баланс')}, +{bonus}%)"
-        return f"{cname} — {TACTIC_LABELS.get(tactic, '⚖️ Сбалансировано')} (бафф {bonus}%)"
+        return f"{cname} - {TACTIC_LABELS.get(tactic, '⚖️ Сбалансировано')} (бафф {bonus}%)"
 
     coach_a_text, coach_b_text = _coach_info(team_a), _coach_info(team_b)
+
+    def _safe_power(owner_id, cid):
+        try:
+            return int(get_player_card_power(owner_id, cid, card_map))
+        except Exception:
+            card = card_map.get(cid) or {}
+            return int(get_card_power(card)) if card else 0
+
+    def _lineup_text(team, owner_id):
+        if not team:
+            return 'Состав недоступен'
+        lines = []
+        gk_id = team.get('gk')
+        if gk_id:
+            lines.append(f"🥅 Вратарь: {_card_name(gk_id, card_map)} - сила {_safe_power(owner_id, gk_id)}")
+        for fid in team.get('field', []):
+            lines.append(f"⚔️ Полевой: {_card_name(fid, card_map)} - сила {_safe_power(owner_id, fid)}")
+        coach_id = team.get('coach')
+        tactic = team.get('tactic', 'balanced')
+        if coach_id:
+            coach_card = card_map.get(coach_id)
+            bonus = round(get_coach_bonus(coach_card.get('rarity', '')) * 100) if coach_card else 3
+            coach_name = _card_name(coach_id, card_map)
+            lines.append(f"🧠 Тренер: {coach_name} - {TACTIC_PLAIN.get(tactic, 'Баланс')} (бафф {bonus}%)")
+        else:
+            lines.append("🧠 Тренер: без тренера")
+        return '\n'.join(lines)
+
+    lineup_a = _lineup_text(team_a, user_a)
+    lineup_b = _lineup_text(team_b, user_b)
+
     for uid in recipients:
+        if uid == user_a:
+            opponent_name, opponent_lineup = nb, lineup_b
+            my_name, my_lineup = na, lineup_a
+        else:
+            opponent_name, opponent_lineup = na, lineup_a
+            my_name, my_lineup = nb, lineup_b
         await send(
             uid,
-            f'🏒 <b>Матч начался:</b> {na} 🆚 {nb}\n💪 Сила составов: {int(sa)} 🆚 {int(sb)}\n\n'
+            f'🏒 <b>Матч начался:</b> {na} 🆚 {nb}\n'
+            f'💪 Сила составов: {int(sa)} 🆚 {int(sb)}\n\n'
+            f'👀 <b>Состав соперника — {opponent_name}:</b>\n{html.escape(opponent_lineup)}\n\n'
+            f'🧊 <b>Ваш состав — {my_name}:</b>\n{html.escape(my_lineup)}\n\n'
             f'🧠 <b>Тренеры:</b>\n▪️ {na}: {html.escape(coach_a_text)}\n▪️ {nb}: {html.escape(coach_b_text)}'
         )
 
@@ -7290,9 +7334,10 @@ async def _simulate_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_
         await asyncio.sleep(1.5)
 
     if ga == gb:
-        # Овертайм — почти монетка: сила даёт лишь минимальный перевес.
+        # Овертайм — всё ещё нервный, но сильная команда теперь получает
+        # чуть более заметный перевес, чем раньше.
         ot_minute = 60 + random.randint(1, 5)
-        ot_pa = max(.44, min(.56, p_a))
+        ot_pa = max(.42, min(.58, p_a))
         line = _goal_event(ot_minute, 'a' if random.random() < ot_pa else 'b')
         period_scores.append('ОТ')
         for uid in recipients:
