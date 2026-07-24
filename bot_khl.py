@@ -1123,7 +1123,7 @@ USER_COMMANDS_TEXT = (
     "🎴 Карточки:\n"
     "/get_card - получить карточку\n"
     "/my_cards - моя коллекция\n"
-    "/card_info <card_id или mINSTANCE_ID> - информация о карточке\n"
+    "/card_info <card_id> - информация о карточке\n"
     "/craft - крафт: обменять карточки на более редкую\n"
     "/upgrade_card <card_id> - прокачать карту дубликатами (+2 силы за уровень)\n"
     "/buff - информация о баффе\n"
@@ -1139,8 +1139,8 @@ USER_COMMANDS_TEXT = (
     "/ref - реферальная ссылка (приглашай друзей — получай монеты)\n\n"
     "🏪 Маркет и обмен:\n"
     "/market - маркет карточек\n"
-    "/sell <card_id или mINSTANCE_ID> <цена> - выставить карточку на маркет\n"
-    "/offer_sell <user_id> <card_id или mINSTANCE_ID> <цена> - личное предложение продажи\n"
+    "/sell <card_id> <цена> - выставить карточку на маркет\n"
+    "/offer_sell <user_id> <card_id> <цена> - личное предложение продажи\n"
     "/my_listings - мои объявления на маркете\n"
     "/unlist <ID объявления> - снять свой лот\n"
     "/trade <user_id> <card_id...до 10> - предложить обмен до 10 карт\n"
@@ -1694,12 +1694,9 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cards = load_data(CARDS_FILE, [])
         card = next((c for c in cards if c["id"] == card_id), None)
         mutation_instance = None
-        if card and random.random() < _get_effective_mutation_drop_chance():
-            mutation_instance = add_mutated_card(user.id, card_id, _roll_mutation_key())
-        else:
-            users[str(user.id)] = user_data
-            save_data(USERS_FILE, users)
-            add_one_card(user.id, card_id)
+        users[str(user.id)] = user_data
+        save_data(USERS_FILE, users)
+        add_one_card(user.id, card_id)
         if card:
             card_name = html.escape(card["name"])
             card_rarity = html.escape(card["rarity"])
@@ -1708,22 +1705,8 @@ async def buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             card_name = f"Карточка ID {card_id}"
             card_rarity = "Неизвестная"
             emoji = "❓"
-        if mutation_instance:
-            meta = _get_mutation_meta(mutation_instance.get("mutation")) or {}
-            mutation_label = html.escape(meta.get("label", "Мутация"))
-            mutation_emoji = meta.get("emoji", "🧬")
-            mutation_bonus = int(meta.get("power_bonus", 0) or 0)
-            pack_text = (
-                f"✅ Вы успешно приобрели набор карточек!\n"
-                f"🎁 Полученная карточка:\n"
-                f"<b>{emoji} {card_rarity}</b>: {card_name}\n"
-                f"{mutation_emoji} <b>Мутация: {mutation_label}</b> (+{mutation_bonus} силы)\n"
-                f"🆔 <b>M-ID:</b> <code>{html.escape(str(mutation_instance.get('instance_id')))}</code>\n\n"
-                f"💰 Потрачено: {item['price']} монет\n"
-                f"💰 Остаток: {new_balance} монет\n\n"
-                f"Мутированная карта уже добавлена отдельным экземпляром.\n"
-                f"Посмотреть её можно в /my_cards"
-            )
+        if False:
+            pass
         else:
             users_after = load_data(USERS_FILE, {})
             user_data_after = users_after.get(str(user.id), {})
@@ -2828,7 +2811,7 @@ async def start_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     normal_available = get_available_card_ids(user.id)
     mutated_available = list(user_data.get("mutated_cards", []))
     if len(normal_available) < 3 and len(mutated_available) < 3:
-        await update.message.reply_text("❌ Для крафта нужно минимум 3 обычные карты или 3 мутированные карты.")
+        await update.message.reply_text("❌ Для крафта нужно минимум 3 обычные карты или 3 карты.")
         return ConversationHandler.END
     message = await show_collection_with_ids(user.id)
     message += (
@@ -2837,12 +2820,10 @@ async def start_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "• Обычная → Редкая\n"
         "• Редкая → Эпическая\n"
         "• шанс успеха 40%, при неудаче обычные карты сгорают\n\n"
-        "<b>Мутированный крафт:</b> 3 мутированные карты одной редкости: <code>m123 m456 m789</code>\n"
+        "<b>Крафт:</b> 3 карты одной редкости: <code>5 12 8</code>\n"
         "• Обычная → Редкая\n"
         "• Редкая → Эпическая\n"
-        "• мутированный крафт не сжигает карты впустую: результат будет всегда\n"
-        "• шанс 0.1%, что новая карта выйдет без мутации\n\n"
-        "⚠️ Нельзя смешивать обычные ID и M-ID в одном крафте."
+        "• используйте только обычные ID карточек."
     )
     await _reply_long_html(update.message, message)
     context.user_data.clear()
@@ -2859,17 +2840,18 @@ def _parse_craft_token(token: str):
 
 async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+    # Особые версии временно отключены: крафт работает только с обычными карточками.
     raw_tokens = update.message.text.replace(",", " ").replace(";", " ").split()
     try:
         items = [_parse_craft_token(t) for t in raw_tokens]
         if len(items) != 3:
             raise ValueError
     except Exception:
-        await update.message.reply_text("❌ Неверный формат! Введите ровно 3 карты: обычные ID <code>1 2 3</code> или мутированные <code>mID mID mID</code>.", parse_mode="HTML")
+        await update.message.reply_text("❌ Неверный формат! Введите ровно 3 карты: обычные ID <code>1 2 3</code> или карты <code>mID mID mID</code>.", parse_mode="HTML")
         return CRAFT_SELECT_CARDS
     kinds = {i["type"] for i in items}
     if len(kinds) != 1:
-        await update.message.reply_text("❌ Нельзя смешивать обычные и мутированные карты в одном крафте.")
+        await update.message.reply_text("❌ Нельзя смешивать обычные и карты в одном крафте.")
         return CRAFT_SELECT_CARDS
     cards_data = load_data(CARDS_FILE, [])
     card_map = {c["id"]: c for c in cards_data}
@@ -2932,29 +2914,29 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             await update.message.reply_text("❌ Крафт не удался!\nВсе 3 обычные карты были потеряны.")
         return ConversationHandler.END
 
-    # ================= Мутированный крафт =================
+    # ================= Крафт =================
     instance_ids = [str(i["instance_id"]) for i in items]
     if len(set(instance_ids)) != 3:
-        await update.message.reply_text("❌ Нужно указать 3 разные мутированные карты. Один и тот же M-ID нельзя использовать дважды.")
+        await update.message.reply_text("❌ Нужно указать 3 разные карты. Один и тот же ID нельзя использовать дважды.")
         return CRAFT_SELECT_CARDS
     instances = []
     for mid in instance_ids:
         inst = _get_mutation_instance(user.id, mid)
         if not inst:
-            await update.message.reply_text(f"❌ Мутированная карта M-ID <code>{html.escape(mid)}</code> не найдена или недоступна.", parse_mode="HTML")
+            await update.message.reply_text(f"❌ Карта <code>{html.escape(mid)}</code> не найдена или недоступна.", parse_mode="HTML")
             return CRAFT_SELECT_CARDS
         instances.append(inst)
     base_cards = [card_map.get(int(inst.get("card_id", -1))) for inst in instances]
     if any(c is None for c in base_cards):
-        await update.message.reply_text("❌ Базовая карта одной из мутаций не найдена. Крафт отменён.")
+        await update.message.reply_text("❌ Одна из карт не найдена. Крафт отменён.")
         return CRAFT_SELECT_CARDS
     rarities = {c.get("rarity") for c in base_cards}
     if len(rarities) != 1:
-        await update.message.reply_text("❌ Все мутированные карты должны быть одной редкости!")
+        await update.message.reply_text("❌ Все карты должны быть одной редкости!")
         return CRAFT_SELECT_CARDS
     rarity = next(iter(rarities))
     if rarity not in ["Обычная", "Редкая"]:
-        await update.message.reply_text("❌ Мутированный крафт доступен только для мутированных карт Обычной и Редкой редкости!")
+        await update.message.reply_text("❌ Крафт доступен только для карт Обычной и Редкой редкости!")
         return CRAFT_SELECT_CARDS
     new_rarity = "Редкая" if rarity == "Обычная" else "Эпическая"
     # Списываем после проверок, с rollback.
@@ -2964,7 +2946,7 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         if not removed:
             for old in removed_instances:
                 add_mutated_card_instance(user.id, old)
-            await update.message.reply_text("❌ Не удалось списать мутированные карты. Крафт отменён, карты возвращены.")
+            await update.message.reply_text("❌ Не удалось списать карты. Крафт отменён, карты возвращены.")
             return ConversationHandler.END
         _save_user_mutated_cards(user.id, mutated_cards)
         removed_instances.append(removed)
@@ -2973,7 +2955,7 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if not new_cards:
         for old in removed_instances:
             add_mutated_card_instance(user.id, old)
-        await update.message.reply_text("❌ Нет карт нужной редкости. Крафт отменён, мутированные карты возвращены.")
+        await update.message.reply_text("❌ Нет карт нужной редкости. Крафт отменён, карты возвращены.")
         return ConversationHandler.END
     new_card = random.choice(new_cards)
     no_mutation = random.random() < 0.001
@@ -2981,18 +2963,18 @@ async def process_craft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if no_mutation:
         add_one_card(user.id, new_card["id"])
         result_text = (
-            f"🎉 <b>Мутированный крафт завершён!</b>\n"
-            f"Редкий сбой мутации 0.1%: новая карта вышла без мутации.\n\n"
+            f"🎉 <b>Крафт завершён!</b>\n"
+            f"Редкий сбой особые версии 0.1%: новая карта вышла без особые версии.\n\n"
             f"Получено: <b>{html.escape(new_card['name'])}</b> ({new_rarity})"
         )
     else:
-        mutation_instance = add_mutated_card(user.id, new_card["id"], _roll_mutation_key())
+        add_one_card(user.id, new_card["id"]); mutation_instance = None
         meta = _get_mutation_meta(mutation_instance.get("mutation")) or {}
         result_text = (
-            f"🎉 <b>Мутированный крафт успешен!</b>\n\n"
+            f"🎉 <b>Крафт успешен!</b>\n\n"
             f"Получено: <b>{html.escape(new_card['name'])}</b> ({new_rarity})\n"
-            f"{meta.get('emoji','🧬')} Мутация: <b>{html.escape(meta.get('label','Мутация'))}</b> (+{meta.get('power_bonus',0)} силы)\n"
-            f"🆔 M-ID: <code>{html.escape(str(mutation_instance.get('instance_id')))}</code>"
+            f"{meta.get('emoji','🧬')} Особая версия: <b>{html.escape(meta.get('label','Особая версия'))}</b> (+{meta.get('power_bonus',0)} силы)\n"
+            ""
         )
     inc_stat(user.id, 'craft_success', 1)
     log_action(user.id, 'mutated_craft_success', f"{new_card['id']} mutation={not no_mutation}") if 'log_action' in globals() else None
@@ -3735,9 +3717,8 @@ TITLE_DEFS = [
     {"key":"rookie","name":"🆕 Новичок","need":"доступен сразу","check":lambda u,s,uid: True},
     {"key":"collector","name":"📚 Коллекционер","need":"иметь 25 обычных карт","check":lambda u,s,uid: len(u.get('cards',[]))>=25},
     {"key":"archive","name":"🧺 Архивариус","need":"иметь 100 обычных карт","check":lambda u,s,uid: len(u.get('cards',[]))>=100},
-    {"key":"mutant","name":"🧬 Мутант","need":"получить 1 мутированную карту","check":lambda u,s,uid: len(u.get('mutated_cards',[]))>=1},
-    {"key":"mutlord","name":"👑 Повелитель мутаций","need":"иметь 10 мутированных карт","check":lambda u,s,uid: len(u.get('mutated_cards',[]))>=10},
-    {"key":"rich","name":"💰 Богач","need":"иметь 10 000 монет на балансе","check":lambda u,s,uid: get_coins(uid)>=10000},
+    {"key":"mutant","name":"🧬 Мутант","need":"получить 1 карту","check":lambda u,s,uid: len(u.get('mutated_cards',[]))>=1},
+        {"key":"rich","name":"💰 Богач","need":"иметь 10 000 монет на балансе","check":lambda u,s,uid: get_coins(uid)>=10000},
     {"key":"duelist","name":"⚔️ Дуэлянт","need":"выиграть 5 дуэлей","check":lambda u,s,uid: s.get('duel_wins',0)>=5},
     {"key":"duelking","name":"🏴‍☠️ Король дуэлей","need":"выиграть 25 дуэлей","check":lambda u,s,uid: s.get('duel_wins',0)>=25},
     {"key":"hockey","name":"🏒 Хоккеист","need":"сыграть 5 рейтинговых матчей","check":lambda u,s,uid: s.get('rating_matches',0)>=5},
@@ -3951,9 +3932,7 @@ def validate_rating_team(user_id:int):
     normal_cards=list(load_data(USERS_FILE,{}).get(str(user_id),{}).get('cards',[]))
     for ref in refs:
         if _is_team_mutation_ref(ref):
-            if not _team_ref_mutation_instance(user_id, ref):
-                return False,'мутированная карта из состава недоступна'
-            continue
+            return False,'карта из состава недоступна'
         cid=_team_ref_card_id(ref)
         if cid in normal_cards:
             normal_cards.remove(cid)
@@ -4093,9 +4072,9 @@ def build_profile_card(user_id:int, name:str):
         d.text((1230,126),'⭐ Рейтинг',font=f_lab,fill=(180,205,235)); d.text((1230,158),str(elo),font=f_big,fill=(255,255,255))
 
         # stats left 2 columns
-        coins=get_coins(user_id); normal=len(u.get('cards',[])); mutated=len(u.get('mutated_cards',[])); seen=len(u.get('seen_cards',[])); total=len(load_data(CARDS_FILE, []))
+        coins=get_coins(user_id); normal=len(u.get('cards',[])); seen=len(u.get('seen_cards',[])); total=len(load_data(CARDS_FILE, []))
         matches=int(st.get('rating_matches',0)); wins=int(st.get('rating_wins',0)); wr=round(wins/max(1,matches)*100,1)
-        stats=[('💰 Баланс',_fmt_coins(coins)),('🃏 Карты',f'{normal} + 🧬 {mutated}'),('📚 Уникальные',f'{seen}/{total}'),('🏒 Матчи',str(matches)),('🏆 Победы',str(wins)),('📈 Винрейт',f'{wr}%'),('⚔️ Дуэли',f"{st.get('duel_wins',0)} побед"),('🛠 Крафты',f"{st.get('craft_success',0)} успешных")]
+        stats=[('💰 Баланс',_fmt_coins(coins)),('🃏 Карты',str(normal)),('📚 Уникальные',f'{seen}/{total}'),('🏒 Матчи',str(matches)),('🏆 Победы',str(wins)),('📈 Винрейт',f'{wr}%'),('⚔️ Дуэли',f"{st.get('duel_wins',0)} побед"),('🛠 Крафты',f"{st.get('craft_success',0)} успешных")]
         x0,y0=82,288; cw,ch,gap=350,118,24
         for i,(lab,val) in enumerate(stats):
             x=x0+(i%2)*(cw+gap); y=y0+(i//2)*(ch+gap)
@@ -4148,7 +4127,7 @@ def build_profile_card(user_id:int, name:str):
         fit_text(118,900,style_line,f_lab,(215,235,255),920)
         fit_text(118,934,'/profile_custom • /cosmetic_shop • /my_cosmetics • /quests',f_small,(170,195,225),1100)
         # watermark
-        d.text((W-310,925),'Хоккейные карточки',font=font(28,True),fill=(*frame_col,))
+        d.text((W-390,925),'@RUSHOCKEYCARDS_BOT',font=font(28,True),fill=(*frame_col,))
         out=io.BytesIO(); img.save(out,'PNG',quality=95); out.seek(0); return out
     except Exception as e:
         logger.warning(f'profile card error: {e}')
@@ -4183,7 +4162,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🏆 <b>Трофейных очков:</b> {trophy_pts}\n"
         f"⭐ <b>Рейтинг:</b> {elo} — {rank[1]} {rank[2]}\n"
         f"💰 <b>Баланс:</b> {get_coins(user.id)} монет\n"
-        f"🃏 <b>Карты:</b> обычных {len(normal_cards)}, мутированных {len(mutated_cards)}\n"
+        f"🃏 <b>Карты:</b> обычных {len(normal_cards)}, карт {len(mutated_cards)}\n"
         f"📊 <b>Уникальных открыто:</b> {len(seen)}/{len(cards)}\n\n"
         f"🏒 <b>Рейтинг-матчи:</b> {matches}, побед {wins}, винрейт {wr}%\n"
         f"⚔️ <b>Дуэли:</b> {st.get('duel_played',0)}, побед {st.get('duel_wins',0)}\n"
@@ -4241,9 +4220,10 @@ def _parse_trade_card_tokens(text: str):
     for tok in raw:
         kind, val = _parse_sell_target(tok) if '_parse_sell_target' in globals() else ('normal', tok)
         if kind == 'mutated':
+            return None, 'временные особые версии отключены'
             mid = str(val)
             if mid in seen_mut:
-                return None, f"мутированная карта {tok} указана дважды"
+                return None, f"карта {tok} указана дважды"
             seen_mut.add(mid)
             result.append({"type": "mutated", "instance_id": mid})
         else:
@@ -4266,7 +4246,7 @@ def _trade_cards_available(user_id: int, items: list):
         if item.get("type") == "mutated":
             mid = item.get("instance_id")
             if not _get_mutation_instance(user_id, mid):
-                return False, f"мутированная карта M-ID {mid} недоступна"
+                return False, f"карта {mid} недоступна"
             ok, reason = _can_sell_mutated_card(user_id, mid) if '_can_sell_mutated_card' in globals() else (True, '')
             if not ok:
                 return False, reason
@@ -4285,10 +4265,10 @@ def _trade_item_name(user_id: int, item: dict, card_map: dict):
     if item.get("type") == "mutated":
         inst = _get_mutation_instance(user_id, item.get("instance_id"))
         if not inst:
-            return f"M-ID {item.get('instance_id')}"
+            return f"ID {item.get('instance_id')}"
         card = card_map.get(inst.get("card_id"), {})
         meta = _get_mutation_meta(inst.get("mutation")) or {}
-        return f"{card.get('name', 'Карта')} [{meta.get('label', 'Мутация')}] M-ID {inst.get('instance_id')}"
+        return f"{card.get('name', 'Карта')} ID {inst.get('instance_id')}"
     card = card_map.get(int(item.get("card_id")), {})
     return f"{card.get('name', 'Карта')} ID {item.get('card_id')}"
 
@@ -4992,7 +4972,7 @@ async def events_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data.clear()
         context.user_data["evt_flow"] = "boost_now"
         await query.edit_message_text(
-            "⚡ <b>Буст выпадения</b>\n\nВведите редкость или напишите <b>Мутация</b> для буста шанса на мутированные карты:",
+            "⚡ <b>Буст выпадения</b>\n\nВведите редкость или напишите <b>Особая версия</b> для буста шанса на карты:",
             parse_mode="HTML",
         )
         return
@@ -5098,7 +5078,7 @@ async def events_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 return
             context.user_data["evt_delay"] = delay
             context.user_data["evt_step"] = "rarity"
-            await update.message.reply_text("Введите редкость или Мутация:")
+            await update.message.reply_text("Введите редкость:")
             return
         if step == "rarity":
             context.user_data["evt_rarity"] = text
@@ -5998,8 +5978,29 @@ async def update_bot_file(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     current_path = os.path.abspath(__file__)
     new_path = os.path.join(os.path.dirname(current_path), "bot_new.py")
     try:
-        tg_file = await doc.get_file()
-        await tg_file.download_to_drive(new_path)
+        # Большие .py файлы Telegram иногда отдаёт дольше стандартного таймаута.
+        # Поэтому скачиваем с увеличенными timeout и несколькими попытками.
+        last_download_error = None
+        for attempt in range(1, 4):
+            try:
+                tg_file = await doc.get_file(read_timeout=120, write_timeout=120, connect_timeout=30, pool_timeout=30)
+                await tg_file.download_to_drive(
+                    new_path,
+                    read_timeout=180,
+                    write_timeout=180,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+                last_download_error = None
+                break
+            except Exception as download_error:
+                last_download_error = download_error
+                logger.warning(f"/update download attempt {attempt} failed: {download_error}")
+                if attempt < 3:
+                    await update.message.reply_text(f"⏳ Telegram долго отдаёт файл, пробую ещё раз ({attempt}/3)...")
+                    await asyncio.sleep(2)
+        if last_download_error:
+            raise last_download_error
         with open(new_path, encoding="utf-8") as f:
             source = f.read()
         # Проверка синтаксиса: битый файл не будет установлен
@@ -6444,7 +6445,7 @@ async def rating_team_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Чтобы не ломать Telegram при большой коллекции, полный список здесь не отправляю.\n"
         f"Откройте /my_cards и скопируйте нужные ID.\n\n"
         f"🥅 Введите ID карточки для <b>ВРАТАРЯ</b>.\n"
-        f"Для мутированной карты используйте формат <code>mINSTANCE_ID</code> из /my_cards.",
+        f"Используйте обычный ID карточки из /my_cards.",
         parse_mode="HTML",
     )
     return RATING_TEAM_GK
@@ -6455,11 +6456,11 @@ async def rating_team_gk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         gk_ref = _parse_team_card_input(user.id, update.message.text.strip())
     except Exception:
-        await update.message.reply_text("❌ Укажите обычный ID карты или mINSTANCE_ID для мутированной карты.")
+        await update.message.reply_text("❌ Укажите обычный ID карты для карты.")
         return RATING_TEAM_GK
     context.user_data["rating_gk"] = gk_ref
     await update.message.reply_text(
-        "⚔️ Теперь введите 5 карт для полевых игроков через запятую: 2 защитника и 3 нападающих. Можно смешивать обычные ID и мутированные mINSTANCE_ID.\n"
+        "⚔️ Теперь введите 5 карт для полевых игроков через запятую: 2 защитника и 3 нападающих. Используйте обычные ID карточек.\n"
         "Пример: 2, m123456_777, 7, 12, 15"
     )
     return RATING_TEAM_FIELD
@@ -6475,7 +6476,7 @@ async def rating_team_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         field_refs = [_parse_team_card_input(user.id, part) for part in parts]
     except Exception:
-        await update.message.reply_text("❌ Используйте обычные ID или mINSTANCE_ID, например: 2, m123456_777, 7")
+        await update.message.reply_text("❌ Используйте обычные ID, например: 2, m123456_777, 7")
         return RATING_TEAM_FIELD
     gk_ref = context.user_data.get("rating_gk")
     all_refs = [gk_ref] + field_refs
@@ -6484,7 +6485,7 @@ async def rating_team_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return RATING_TEAM_FIELD
     context.user_data["rating_field"] = field_refs
     await update.message.reply_text(
-        "🧠 Теперь введите ID отдельной отдельной карточки-ТРЕНЕРА (обычный ID или mINSTANCE_ID, если тренер мутированный).\n"
+        "🧠 Теперь введите ID отдельной карточки-ТРЕНЕРА.\n"
         "Чем реже карта тренера, тем сильнее бафф его тактики.\n\n"
         "Или напишите «пропустить», чтобы собрать команду без тренера. Тренер — редкая отдельная карточка и может докупаться через магазинные паки."
     )
@@ -6505,7 +6506,7 @@ async def rating_team_coach(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         coach_ref = _parse_team_card_input(user.id, raw_text)
     except Exception:
-        await update.message.reply_text("❌ Введите обычный ID отдельной карточки-тренера или mINSTANCE_ID, либо «пропустить».")
+        await update.message.reply_text("❌ Введите обычный ID отдельной карточки-тренера, либо «пропустить».")
         return RATING_TEAM_COACH
     used = [context.user_data.get("rating_gk")] + list(context.user_data.get("rating_field", []))
     if str(coach_ref) in {str(x) for x in used}:
@@ -6951,7 +6952,7 @@ async def rating_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _team_strength(team: dict, card_map: dict, owner_id=None) -> float:
-    """Сила состава. Для мутированных карт учитывается бонус именно выбранного экземпляра."""
+    """Сила состава. Для карт учитывается бонус именно выбранного экземпляра."""
     def _power(card_ref):
         return _team_ref_power(owner_id, card_ref, card_map)
     gk_ref = team.get('gk')
@@ -7060,7 +7061,7 @@ NEUTRAL_EVENTS = [
 ]
 
 def _pick_field_player(team: dict, card_map: dict, owner_id=None):
-    """Выбирает полевого игрока с учётом силы и поддержкой мутированных экземпляров."""
+    """Выбирает полевого игрока с учётом силы и поддержкой карт экземпляров."""
     field_refs = list(team.get("field", []))
     weights = [max(1, _team_ref_power(owner_id, ref, card_map) if owner_id is not None else get_card_power(_team_ref_card(owner_id, ref, card_map))) for ref in field_refs]
     return random.choices(field_refs, weights=weights, k=1)[0]
@@ -9149,7 +9150,7 @@ MUTATIONS = {
 MUTATION_MARKET_MULTIPLIER = 1.6
 MUTATION_MARKET_BONUS_STEP = 12
 TEAM_MUTATION_PREFIX = "m:"
-MUTATION_EVENT_NAMES = {"мутация", "мутированная", "mutated", "mutation"}
+MUTATION_EVENT_NAMES = set()
 
 
 def _normalize_mutation_token(raw: str) -> str:
@@ -9207,7 +9208,7 @@ def _team_ref_name(user_id, card_ref, card_map: dict, html_safe: bool = True) ->
     mutation = _team_ref_mutation_instance(user_id, card_ref)
     if mutation:
         meta = _get_mutation_meta(mutation.get('mutation')) or {}
-        name = f"{name} [{meta.get('label', 'Мутация')}]"
+        name = f"{name} [{meta.get('label', 'Особая версия')}]"
     return html.escape(name) if html_safe else name
 
 
@@ -9221,7 +9222,7 @@ def _team_ref_power(user_id, card_ref, card_map: dict) -> int:
         level = 0
         if user_id is not None:
             level = load_data(USERS_FILE, {}).get(str(user_id), {}).get('card_upgrades', {}).get(str(card_id), 0)
-        return int(min(cap, base + max(0, int(level)) * 2) + _mutation_bonus_from_instance(mutation))
+        return int(min(cap, base + max(0, int(level)) * 2))
     cid = _team_ref_card_id(card_ref)
     if cid is None:
         return 0
@@ -9247,16 +9248,8 @@ def _parse_team_card_input(user_id: int, raw_text: str):
 
 
 def _get_effective_mutation_drop_chance() -> float:
-    chance = MUTATION_DROP_CHANCE
-    for boost in get_active_drop_boosts():
-        rarity = str(boost.get('rarity', '')).strip().lower()
-        if rarity in MUTATION_EVENT_NAMES:
-            try:
-                chance *= float(boost.get('multiplier', 1))
-            except Exception:
-                pass
-    return max(0.0, min(1.0, chance))
-
+    # Особые версии временно полностью отключены.
+    return 0.0
 
 def _ensure_mutation_assets():
     if not PIL_AVAILABLE:
@@ -9412,7 +9405,7 @@ def remove_one_card(user_id: int, card_id: int) -> bool:
         users[str(user_id)] = user_data
         save_data(USERS_FILE, users)
         return True
-    mutated_cards = list(user_data.get("mutated_cards", []))
+    mutated_cards = []  # особые версии временно скрыты
     same = [m for m in mutated_cards if int(m.get("card_id", -1)) == int(card_id)]
     if not same:
         return False
@@ -9429,7 +9422,7 @@ def _collect_user_inventory(user_id: int):
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user_id), {})
     normal_cards = list(user_data.get("cards", []))
-    mutated_cards = list(user_data.get("mutated_cards", []))
+    mutated_cards = []  # особые версии временно скрыты
     return user_data, normal_cards, mutated_cards
 
 
@@ -9471,27 +9464,6 @@ async def show_collection_with_ids(user_id: int) -> str:
                 count_text = f" (x{count})" if count > 1 else ""
                 message += f"   • {html.escape(card['name'])}{lvl_text}{count_text} [ID: {card['id']}]\n"
             message += "\n"
-    if mutated_cards:
-        message += "🧬 <b>Мутированные</b>\n"
-        by_rarity = {}
-        for item in mutated_cards:
-            card = card_map.get(int(item.get("card_id", -1)))
-            if not card:
-                continue
-            by_rarity.setdefault(card.get("rarity", "Обычная"), []).append((card, item))
-        for rarity in sorted(by_rarity.keys(), key=_collection_sort_key):
-            emoji = get_rarity_emoji(rarity)
-            message += f"{emoji} <b>{html.escape(rarity)}</b> ({len(by_rarity[rarity])}):\n"
-            for card, item in sorted(by_rarity[rarity], key=lambda x: (x[0]['id'], str(x[1].get('instance_id')))):
-                meta = _get_mutation_meta(item.get("mutation")) or {}
-                lvl = int(user_data.get("card_upgrades", {}).get(str(card["id"]), 0))
-                lvl_text = f" ⭐ур.{lvl}" if lvl > 0 else ""
-                message += (
-                    f"   • {html.escape(card['name'])}{lvl_text} — {meta.get('emoji', '🧬')} "
-                    f"<b>{html.escape(meta.get('label', 'Мутация'))}</b> (+{meta.get('power_bonus', 0)}) "
-                    f"[M-ID: {html.escape(str(item.get('instance_id')))} | ID: {card['id']}]\n"
-                )
-            message += "\n"
     if locked:
         locked_counts = Counter(locked)
         message += f"🔒 <b>Недоступны</b> ({len(locked)} — на маркете или в работе):\n"
@@ -9502,14 +9474,14 @@ async def show_collection_with_ids(user_id: int) -> str:
             message += f"   • {html.escape(cname)}{count_text} [ID: {cid}]\n"
         message += "\n"
     message += (
-        f"📚 <b>Обычных: {len(normal_cards)}</b>\n"
-        f"🧬 <b>Мутированных: {len(mutated_cards)}</b>\n"
-        f"💡 Мутированный лот на маркете: <code>/sell mINSTANCE_ID цена</code>"
+        f"📚 <b>Карточек: {len(normal_cards)}</b>\n"
+        f"💡 Лот на маркете: <code>/sell card_id цена</code>"
     )
     return message
 
 
 def get_framed_card_photo(card: dict, mutation_instance: dict | None = None):
+    """Красивая хоккейная карточка: ледовая арена, шайба/линии льда, премиальная рамка редкости."""
     if not PIL_AVAILABLE:
         return None
     src_path = os.path.join(CARDS_IMAGE_DIR, card.get("image", ""))
@@ -9517,54 +9489,95 @@ def get_framed_card_photo(card: dict, mutation_instance: dict | None = None):
         return None
     try:
         os.makedirs(FRAMED_CARDS_DIR, exist_ok=True)
-        _ensure_mutation_assets()
-        mutation_key = mutation_instance.get("mutation") if mutation_instance else ""
-        mutation_meta = _get_mutation_meta(mutation_key) if mutation_key else None
         mtime = int(os.path.getmtime(src_path))
-        cache_key = f"{card['id']}_{card.get('rarity','')}_{mtime}_{mutation_key or 'normal'}.png"
+        cache_key = f"hockey_{card['id']}_{card.get('rarity','')}_{mtime}.png"
         cache_key = re.sub(r'[^A-Za-z0-9_.-]+', '_', cache_key)
         cache_path = os.path.join(FRAMED_CARDS_DIR, cache_key)
         if os.path.exists(cache_path):
             return open(cache_path, "rb")
-        img = Image.open(src_path).convert("RGBA")
-        img = ImageOps.fit(img, (512, 512), centering=(0.5, 0.35))
-        canvas = Image.new("RGBA", (512, 640), (8, 12, 24, 255))
+
+        W, H = 720, 1024
         main, light = _rarity_frame_colors(card.get("rarity", "Обычная"))
+        canvas = Image.new("RGBA", (W, H), (5, 12, 28, 255))
         d = ImageDraw.Draw(canvas)
-        for y in range(0, 640, 8):
-            d.line((0, y, 512, y), fill=(10, 16, 32 + (y % 16), 255), width=1)
-        canvas.alpha_composite(img, (0, 0))
-        for g in range(22, 0, -4):
-            d.rounded_rectangle((14-g, 14-g, 512-14+g, 512-14+g), radius=28, outline=(*light, max(18, 85 - g * 2)), width=2)
-        d.rounded_rectangle((18, 18, 494, 494), radius=24, outline=(*main, 255), width=8)
-        d.rounded_rectangle((28, 28, 484, 484), radius=18, outline=(*light, 210), width=3)
-        name_font = _load_team_font(30)
-        small_font = _load_team_font(22)
+
+        # ледовый градиент / арена
+        for y in range(H):
+            t = y / max(1, H - 1)
+            r = int(6 + 20 * t); g = int(18 + 48 * t); b = int(42 + 78 * t)
+            d.line((0, y, W, y), fill=(r, g, b, 255))
+        # свет прожекторов
+        glow = Image.new("RGBA", (W, H), (0,0,0,0)); gd = ImageDraw.Draw(glow)
+        for cx in (120, W-120, W//2):
+            gd.ellipse((cx-170, 40, cx+170, 380), fill=(*light, 38))
+        glow = glow.filter(ImageFilter.GaussianBlur(36))
+        canvas = Image.alpha_composite(canvas, glow); d = ImageDraw.Draw(canvas)
+        # линии льда
+        for x in range(-200, W+220, 90):
+            d.line((x, 250, x+260, H-80), fill=(160, 225, 255, 28), width=2)
+        d.arc((70, 535, W-70, 990), 200, 340, fill=(230,245,255,70), width=4)
+        d.line((0, 760, W, 760), fill=(220,40,65,80), width=5)
+
+        # внешняя премиальная форма карточки
+        for off, alpha in [(28,70),(18,115),(8,190)]:
+            d.rounded_rectangle((42-off, 42-off, W-42+off, H-42+off), radius=54, outline=(*light, alpha), width=4)
+        d.rounded_rectangle((54, 54, W-54, H-54), radius=46, fill=(8,18,38,235), outline=(*main,255), width=10)
+        d.rounded_rectangle((76, 76, W-76, H-76), radius=34, outline=(235,248,255,180), width=3)
+        # золотые/редкостные углы
+        corner = (*main, 230)
+        for sx, sy in [(92,92),(W-92,92),(92,H-92),(W-92,H-92)]:
+            if sx < W//2 and sy < H//2:
+                pts=[(sx,sy+80),(sx,sy),(sx+120,sy)]
+            elif sx > W//2 and sy < H//2:
+                pts=[(sx,sy+80),(sx,sy),(sx-120,sy)]
+            elif sx < W//2:
+                pts=[(sx,sy-80),(sx,sy),(sx+120,sy)]
+            else:
+                pts=[(sx,sy-80),(sx,sy),(sx-120,sy)]
+            d.line(pts, fill=corner, width=5, joint='curve')
+
+        # фото игрока
+        img = Image.open(src_path).convert("RGBA")
+        photo_w, photo_h = 548, 590
+        img = ImageOps.fit(img, (photo_w, photo_h), centering=(0.5, 0.25))
+        mask = Image.new('L', (photo_w, photo_h), 0); md = ImageDraw.Draw(mask)
+        md.rounded_rectangle((0,0,photo_w,photo_h), radius=30, fill=255)
+        px, py = 86, 118
+        canvas.paste(img, (px, py), mask)
+        d.rounded_rectangle((px, py, px+photo_w, py+photo_h), radius=30, outline=(*light,230), width=5)
+        # стеклянный блик
+        shine = Image.new("RGBA", (W,H), (0,0,0,0)); sd=ImageDraw.Draw(shine)
+        sd.polygon([(105,125),(260,125),(128,708),(86,708)], fill=(255,255,255,34))
+        canvas = Image.alpha_composite(canvas, shine); d=ImageDraw.Draw(canvas)
+
+        # нижняя инфо-панель как у хоккейной карточки
+        d.rounded_rectangle((86, 735, W-86, 910), radius=28, fill=(4,12,28,235), outline=(*main,240), width=4)
+        d.rectangle((96, 806, W-96, 812), fill=(*main,230))
+        name_font = _load_team_font(42)
+        small_font = _load_team_font(28)
+        power_font = _load_team_font(26)
+        def fit_center(text, y, font, fill, maxw):
+            text=str(text)
+            while len(text)>3 and d.textlength(text, font=font)>maxw:
+                text=text[:-2].rstrip()+"…"
+            tw=d.textlength(text,font=font)
+            d.text(((W-tw)/2,y), text, font=font, fill=fill)
+        fit_center(card.get("name", "?"), 754, name_font, (248,252,255,255), W-210)
+        rarity_line = f"{get_rarity_emoji(card.get('rarity',''))} {card.get('rarity','Обычная')}"
+        fit_center(rarity_line, 824, small_font, (*light,255), W-220)
         try:
-            tw = d.textlength(card.get("name", "?"), font=name_font)
+            pwr = get_card_power(card)
+            fit_center(f"СИЛА {pwr}", 865, power_font, (255,255,255,235), W-220)
         except Exception:
-            tw = len(card.get("name", "?")) * 15
-        name = str(card.get("name", "?"))
-        while tw > 470 and len(name) > 3:
-            name = name[:-1].rstrip() + '…'
-            tw = d.textlength(name, font=name_font)
-        d.text(((512 - tw) / 2, 528), name, font=name_font, fill=(245, 247, 252, 255))
-        rarity_line = f"{get_rarity_emoji(card.get('rarity', ''))} {card.get('rarity', 'Обычная')}"
-        rt = d.textlength(rarity_line, font=small_font)
-        d.text(((512 - rt) / 2, 568), rarity_line, font=small_font, fill=(*light, 255))
-        if mutation_meta:
-            frame = Image.open(mutation_meta["frame_path"]).convert("RGBA")
-            frame = frame.resize((512, 512))
-            canvas.alpha_composite(frame, (0, 0))
-            bonus_line = f"{mutation_meta['emoji']} Мутация: {mutation_meta['label']}  +{mutation_meta['power_bonus']}"
-            mt_font = _load_team_font(24)
-            mtw = d.textlength(bonus_line, font=mt_font)
-            d.rounded_rectangle((28, 600, 484, 632), radius=12, fill=(18, 24, 44, 220), outline=(*mutation_meta['color'], 255), width=2)
-            d.text(((512 - mtw) / 2, 605), bonus_line, font=mt_font, fill=(*mutation_meta['glow'], 255))
-        canvas.convert("RGB").save(cache_path)
+            pass
+        # шайба внизу
+        d.ellipse((W//2-42, 934, W//2+42, 970), fill=(8,12,20,255), outline=(*light,200), width=3)
+        d.arc((W//2-34, 936, W//2+34, 966), 190, 350, fill=(210,235,255,120), width=2)
+
+        canvas.convert("RGB").save(cache_path, quality=95)
         return open(cache_path, "rb")
     except Exception as e:
-        logger.error(f"Не удалось построить framed card photo: {e}")
+        logger.error(f"Не удалось построить hockey card photo: {e}")
         return None
 
 
@@ -9616,7 +9629,7 @@ def _build_mutation_reveal_animation(card: dict, mutation_instance: dict):
         bio.seek(0)
         return bio
     except Exception as e:
-        logger.error(f"Не удалось построить GIF мутации: {e}")
+        logger.error(f"Не удалось построить GIF особые версии: {e}")
         return None
 
 
@@ -9626,9 +9639,6 @@ def get_player_card_power(user_id:int, card_id:int, card_map:dict)->int:
     cap = get_card_rating_cap(card)
     level = load_data(USERS_FILE,{}).get(str(user_id),{}).get('card_upgrades',{}).get(str(card_id),0)
     total = min(cap, base + max(0,int(level))*2)
-    mutation = _best_mutation_for_card(user_id, card_id)
-    if mutation:
-        total += _mutation_bonus_from_instance(mutation)
     return total
 
 
@@ -9641,20 +9651,13 @@ async def card_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(subscription_required_text())
         return
     if not context.args:
-        await update.message.reply_text("ℹ️ Использование: /card_info <ID карточки или mINSTANCE_ID>")
+        await update.message.reply_text("ℹ️ Использование: /card_info <ID карточки>")
         return
     raw = context.args[0].strip()
-    target_mutation = None
     try:
-        if raw.lower().startswith('m') and raw[1:]:
-            target_mutation = _get_mutation_instance(user.id, raw[1:])
-            if not target_mutation:
-                raise ValueError
-            card_id = int(target_mutation.get('card_id'))
-        else:
-            card_id = int(raw)
+        card_id = int(raw)
     except ValueError:
-        await update.message.reply_text("❌ Неверный формат ID! Используйте ID карточки или mINSTANCE_ID.")
+        await update.message.reply_text("❌ Неверный формат ID! Используйте ID карточки.")
         return
     if card_id not in get_available_card_ids(user.id):
         await update.message.reply_text("❌ У вас нет этой карточки в коллекции!")
@@ -9675,28 +9678,14 @@ async def card_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if "description" in card:
         caption += f"📝 <b>Описание</b>: {html.escape(card['description'])}\n"
     normal_count = list(user_data.get("cards", [])).count(card_id)
-    mutated_items = [m for m in user_data.get("mutated_cards", []) if int(m.get("card_id", -1)) == int(card_id)]
-    caption += f"📦 <b>Обычных копий</b>: {normal_count}\n"
-    caption += f"🧬 <b>Мутированных копий</b>: {len(mutated_items)}\n"
+    caption += f"📦 <b>Копий</b>: {normal_count}\n"
     card_map = {c["id"]: c for c in cards}
     lvl = int(user_data.get("card_upgrades", {}).get(str(card_id), 0))
     caption += f"💪 <b>Сила</b>: {get_player_card_power(user.id, card_id, card_map)}"
     if lvl > 0:
         caption += f" (⭐ ур. {lvl})"
     caption += "\n"
-    if target_mutation:
-        meta = _get_mutation_meta(target_mutation.get("mutation")) or {}
-        caption += (
-            f"🧬 <b>Выбранная мутация</b>: {meta.get('label', 'Мутация')}\n"
-            f"⚡ <b>Бонус силы</b>: +{meta.get('power_bonus', 0)}\n"
-            f"🆔 <b>M-ID</b>: {html.escape(str(target_mutation.get('instance_id')))}\n"
-        )
-    elif mutated_items:
-        caption += "🧬 <b>Мутации у этой карточки</b>:\n"
-        for item in mutated_items[:5]:
-            meta = _get_mutation_meta(item.get("mutation")) or {}
-            caption += f"   • {meta.get('emoji', '🧬')} {meta.get('label', 'Мутация')} (+{meta.get('power_bonus', 0)}) [m{item.get('instance_id')}]\n"
-    photo = get_framed_card_photo(card, target_mutation)
+    photo = get_framed_card_photo(card)
     if photo:
         await update.message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
     else:
@@ -9716,7 +9705,7 @@ async def _get_card_with_mutation_core(update: Update, context: ContextTypes.DEF
     current_time = time.time()
     last_drop = user_data.get("last_drop", 0)
     base_cooldown = 6 * 3600
-    # Для главного админа отключаем кулдаун /get_card — удобно для тестов дропов и мутаций.
+    # Для главного админа отключаем кулдаун /get_card — удобно для тестов дропов.
     if user.id == ADMIN_ID:
         time_left = 0
     else:
@@ -9759,18 +9748,14 @@ async def _get_card_with_mutation_core(update: Update, context: ContextTypes.DEF
         rarity_cards = cards
     card = random.choice(rarity_cards)
 
-    is_mutated = random.random() < _get_effective_mutation_drop_chance()
+    is_mutated = False
     mutation_instance = None
-    if is_mutated:
-        mutation_key = _roll_mutation_key()
-        mutation_instance = add_mutated_card(user.id, card["id"], mutation_key)
-    else:
-        if "cards" not in user_data:
-            user_data["cards"] = []
-        user_data["cards"].append(card["id"])
-        users[str(user.id)] = user_data
-        save_data(USERS_FILE, users)
-        add_seen_card(user.id, card["id"])
+    if "cards" not in user_data:
+        user_data["cards"] = []
+    user_data["cards"].append(card["id"])
+    users[str(user.id)] = user_data
+    save_data(USERS_FILE, users)
+    add_seen_card(user.id, card["id"])
 
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user.id), {})
@@ -9791,93 +9776,39 @@ async def _get_card_with_mutation_core(update: Update, context: ContextTypes.DEF
         f"🏷 Название: {card['name']}\n"
         f"⭐ Редкость: {card['rarity']}\n"
     )
-    if mutation_instance:
-        meta = _get_mutation_meta(mutation_instance.get("mutation")) or {}
-        caption += (
-            f"🧬 Мутация: {meta.get('label', 'Мутация')}\n"
-            f"⚡ Бонус силы: +{meta.get('power_bonus', 0)}\n"
-            f"🆔 M-ID: {mutation_instance.get('instance_id')}\n"
-            f"📦 Мутированных копий этой карты: {mutated_count}\n"
-        )
-    else:
-        count_text = f" (x{normal_count})" if normal_count > 1 else ""
-        caption = caption.replace(card['name'], f"{card['name']}{count_text}", 1)
+    count_text = f" (x{normal_count})" if normal_count > 1 else ""
+    caption = caption.replace(card['name'], f"{card['name']}{count_text}", 1)
     if "description" in card:
         caption += f"📝 Описание: {card['description']}\n"
     caption += (
         f"💰 Получено монет: +{coins_earned}\n"
         f"💰 Ваш баланс: {new_balance}\n\n"
-        f"📚 Обычных: {len(user_data.get('cards', []))} | Мутированных: {len(user_data.get('mutated_cards', []))}"
+        f"📚 В вашей коллекции: {len(user_data.get('cards', []))}"
     )
 
     rarity_animations = {
-        "Эксклюзивная": [
-            "🃏 Тянем карточку из колоды...",
-            "🃏 ✨ Колода дрожит...",
-            "😎 💫 Карта СИЯЕТ нереальным светом...",
-            "😎 🌟 Это что-то ЭКСКЛЮЗИВНОЕ...",
-            "😎 🎆 НЕВЕРОЯТНО! Открываем!",
-        ],
-        "Легендарная": [
-            "🃏 Тянем карточку из колоды...",
-            "🃏 ✨ Колода нагревается...",
-            "🔥 Карта пылает огнём...",
-            "🔥 Она СИЯЕТ золотом...",
-            "✨ 🎇 ЛЕГЕНДА! Открываем!",
-        ],
-        "Мифическая": [
-            "🃏 Тянем карточку из колоды...",
-            "🧠 ⚡ Карта искрит идеями...",
-            "🧠 💡 Она блещет умом...",
-            "🧠 🎓 Гениально! Открываем!",
-        ],
-        "Мифическая": [
-            "🃏 Тянем карточку из колоды...",
-            "🃏 🌫 Колоду окутывает туман...",
-            "😳 ⚡ Карта из древних МИФОВ...",
-            "😳 🌌 Она светится магией...",
-            "😳 🔮 МИФИЧЕСКАЯ! Открываем!",
-        ],
-        "Сверхредкая": [
-            "🃏 Тянем карточку из колоды...",
-            "🕶 Карта в тёмных очках...",
-            "🕶 😏 Сверхредкая! Открываем!",
-        ],
-        "Эпическая": [
-            "🃏 Тянем карточку из колоды...",
-            "💎 Карта отливает синим...",
-            "💎 ✨ Эпично! Открываем!",
-        ],
-        "Редкая": [
-            "🃏 Тянем карточку из колоды...",
-            "✨ Что-то блеснуло! Открываем!",
-        ],
-        "Обычная": [
-            "🃏 Тянем карточку из колоды...",
-            "🃏 Открываем!",
-        ],
+        "Легендарная": ["🏒 Открываем премиальный хоккейный пак...", "🏆 Лёд подсвечивается золотом...", "🔥 ЛЕГЕНДАРНАЯ карточка выходит на лёд!"],
+        "Мифическая": ["🏒 Открываем премиальный хоккейный пак...", "🌌 Арена гаснет перед редким дропом...", "🔮 МИФИЧЕСКАЯ карточка!"],
+        "Эпическая": ["🏒 Открываем хоккейный пак...", "💎 Рамка карточки сияет на льду...", "💎 ЭПИЧЕСКАЯ карточка!"],
     }
-    try:
-        if mutation_instance:
-            meta = _get_mutation_meta(mutation_instance.get("mutation")) or {}
-            frames = meta.get("animation", ["🧬 Мутация...", "✨ Мутированная карта!"])
-        else:
-            frames = rarity_animations.get(card.get("rarity"), rarity_animations["Обычная"])
-        anim_msg = await update.message.reply_text(frames[0])
-        for frame in frames[1:]:
-            await asyncio.sleep(0.9)
-            await anim_msg.edit_text(frame)
-        await asyncio.sleep(0.8)
+    frames = rarity_animations.get(card.get("rarity"))
+    if frames:
         try:
-            await anim_msg.delete()
+            anim_msg = await update.message.reply_text(frames[0])
+            for frame in frames[1:]:
+                await asyncio.sleep(0.9)
+                await anim_msg.edit_text(frame)
+            await asyncio.sleep(0.8)
+            try:
+                await anim_msg.delete()
+            except Exception:
+                pass
         except Exception:
             pass
-    except Exception:
-        pass
 
     image_path = os.path.join(CARDS_IMAGE_DIR, card.get("image", ""))
     if os.path.exists(image_path):
-        photo = get_framed_card_photo(card, mutation_instance) or open(image_path, "rb")
+        photo = get_framed_card_photo(card) or open(image_path, "rb")
         await update.message.reply_photo(photo=photo, caption=caption)
     else:
         await update.message.reply_text(caption)
@@ -9900,7 +9831,7 @@ def _format_market_item_name(card: dict, item: dict):
     base = f"{get_rarity_emoji(card.get('rarity', ''))} {html.escape(card.get('name', '?'))}"
     if item.get("mutation_key"):
         meta = _get_mutation_meta(item.get("mutation_key")) or {}
-        return f"{base} • {meta.get('emoji', '🧬')} {html.escape(meta.get('label', 'Мутация'))} (+{meta.get('power_bonus', 0)})"
+        return f"{base} • {meta.get('emoji', '🧬')} {html.escape(meta.get('label', 'Особая версия'))} (+{meta.get('power_bonus', 0)})"
     return base
 
 
@@ -9929,17 +9860,15 @@ def _build_market_page(user_id: int, page: int):
         nav.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"market_page_{page + 1}"))
     if nav:
         keyboard.append(nav)
-    lines.append("\nℹ️ Обычный лот: <code>/sell card_id цена</code> | мутированный: <code>/sell mINSTANCE_ID цена</code>")
+    lines.append("\nℹ️ Обычный лот: <code>/sell card_id цена</code>")
     return "\n".join(lines), InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
 def _parse_sell_target(raw: str):
     token = str(raw or '').strip()
-    low = token.lower()
-    if low.startswith(('m', 'mut_')) or low.startswith('m-id:') or low.startswith('m_id:'):
-        return 'mutated', _normalize_mutation_token(token)
+    if token.lower().startswith('m'):
+        raise ValueError
     return 'normal', int(token)
-
 
 def _rating_team_refs(user_id: int) -> list:
     team = get_rating_team(user_id) or {}
@@ -9980,28 +9909,28 @@ def _can_sell_normal_card(user_id: int, card_id: int) -> tuple[bool, str]:
     normal_cards = list(users.get(str(user_id), {}).get("cards", []))
     owned = normal_cards.count(int(card_id))
     if owned <= 0:
-        return False, "❌ У вас нет обычной копии этой карточки. Если хотите продать мутированную — используйте её M-ID."
+        return False, "❌ У вас нет обычной копии этой карточки. Используйте обычный ID карточки."
     used = _normal_rating_usage_count(user_id, int(card_id))
     if used > 0 and owned - 1 < used:
         return False, (
             "❌ Эта карточка сейчас стоит в рейтинговом составе.\n"
-            "Сначала замените её через /rating_team или продайте другую копию/мутированную карту."
+            "Сначала замените её через /rating_team или продайте другую копию/карту."
         )
     return True, ""
 
 
 def _can_sell_mutated_card(user_id: int, instance_id: str) -> tuple[bool, str]:
-    """Мутированная карта — отдельный экземпляр; нельзя продавать именно тот M-ID, который стоит в составе."""
+    """Особые версии временно отключены."""
     if _mutation_used_in_rating_team(user_id, instance_id):
         return False, (
-            "❌ Эта мутированная карточка сейчас стоит в рейтинговом составе.\n"
+            "❌ Эта карточка сейчас стоит в рейтинговом составе.\n"
             "Сначала замените её через /rating_team, потом выставляйте на продажу."
         )
     return True, ""
 
 
 def remove_one_normal_card(user_id: int, card_id: int) -> bool:
-    """Списывает только обычную копию, не трогая мутированные экземпляры с тем же base card_id."""
+    """Списывает только обычную копию, не трогая карты экземпляры с тем же base card_id."""
     users = load_data(USERS_FILE, {})
     user_data = users.get(str(user_id), {})
     cards = list(user_data.get("cards", []))
@@ -10024,7 +9953,7 @@ async def sell_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_subscribed(user.id, context):
         return
     if len(context.args) < 2:
-        await update.message.reply_text("ℹ️ Использование: /sell <card_id или mINSTANCE_ID> <цена>")
+        await update.message.reply_text("ℹ️ Использование: /sell <card_id> <цена>")
         return
     try:
         target_kind, target_value = _parse_sell_target(context.args[0])
@@ -10048,7 +9977,7 @@ async def sell_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if target_kind == "mutated":
         instance = _get_mutation_instance(user.id, str(target_value))
         if not instance:
-            await update.message.reply_text("❌ Мутированная карточка не найдена.")
+            await update.message.reply_text("❌ Карта карточка не найдена.")
             return
         ok, reason = _can_sell_mutated_card(user.id, str(target_value))
         if not ok:
@@ -10061,11 +9990,11 @@ async def sell_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         meta = _get_mutation_meta(instance.get("mutation")) or {}
         min_price = _get_mutated_market_min_price(card, instance.get("mutation"))
         if price < min_price:
-            await update.message.reply_text(f"❌ Минимальная цена для мутированной карты на маркете: {_fmt_coins(min_price)} монет. Для личного предложения используйте /offer_sell.")
+            await update.message.reply_text(f"❌ Минимальная цена для карты на маркете: {_fmt_coins(min_price)} монет. Для личного предложения используйте /offer_sell.")
             return
         removed, mutated_cards = remove_mutated_card_instance(user.id, str(target_value))
         if not removed:
-            await update.message.reply_text("❌ Не удалось снять мутированную карту из коллекции.")
+            await update.message.reply_text("❌ Не удалось снять карту из коллекции.")
             return
         _save_user_mutated_cards(user.id, mutated_cards)
         market.append({
@@ -10079,7 +10008,7 @@ async def sell_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         })
         save_data(MARKET_FILE, market)
         await update.message.reply_text(
-            f"✅ Мутированная карточка «{card['name']}» ({meta.get('label', 'Мутация')}) выставлена на маркет!\n"
+            f"✅ Карта карточка «{card['name']}» ({meta.get('label', 'Особая версия')}) выставлена на маркет!\n"
             f"🆔 Объявление #{listing_id}\n💰 Цена: {_fmt_coins(price)} монет\n\n"
             f"Отменить: /unlist {listing_id}"
         )
@@ -10205,7 +10134,7 @@ async def offer_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await is_subscribed(user.id, context):
         return
     if len(context.args) < 3:
-        await update.message.reply_text("ℹ️ Использование: /offer_sell <user_id> <card_id или mINSTANCE_ID> <цена>\nМинимальной цены тут нет, максимум 10 000 монет.")
+        await update.message.reply_text("ℹ️ Использование: /offer_sell <user_id> <card_id> <цена>\nМинимальной цены тут нет, максимум 10 000 монет.")
         return
     try:
         buyer_id = int(context.args[0])
@@ -10236,7 +10165,7 @@ async def offer_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if target_kind == "mutated":
         mutation_instance = _get_mutation_instance(user.id, str(target_value))
         if not mutation_instance:
-            await update.message.reply_text("❌ Мутированная карточка не найдена.")
+            await update.message.reply_text("❌ Карта карточка не найдена.")
             return
         ok, reason = _can_sell_mutated_card(user.id, str(target_value))
         if not ok:
@@ -10245,7 +10174,7 @@ async def offer_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         card_id = int(mutation_instance.get("card_id"))
         removed, mutated_cards = remove_mutated_card_instance(user.id, str(target_value))
         if not removed:
-            await update.message.reply_text("❌ Не удалось снять мутированную карту из коллекции.")
+            await update.message.reply_text("❌ Не удалось снять карту из коллекции.")
             return
         _save_user_mutated_cards(user.id, mutated_cards)
         mutation_instance = removed
@@ -10428,7 +10357,7 @@ PROFILE_BADGES = {
     "crown": {"name": "Корона", "emoji": "👑"},
     "skull": {"name": "Череп", "emoji": "💀"},
     "puck": {"name": "Шайба", "emoji": "🏒"},
-    "mutant": {"name": "Мутация", "emoji": "🧬"},
+    "mutant": {"name": "Особая версия", "emoji": "🧬"},
 }
 
 def _profile_custom(user_id:int) -> dict:
